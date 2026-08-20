@@ -52,3 +52,7 @@ Thumbs.db
 .kimi-code/
 stderr.txt
 stdout.txt
+
+# Accidental pip/shell artifacts
+=1.1.0
+=4.0.0
