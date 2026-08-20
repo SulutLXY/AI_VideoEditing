@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.venv311/
+
+# Model weights & caches（大模型不纳入版本控制）
+models/
+*.onnx
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.h5
+*.mlmodel
+
+# Project runtime outputs
+output/
+temp/
+workspace/
+logs/
+*.log
+
+# User-specific config with possible API keys
+config.yaml
+config/config.yaml
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Session / tool artifacts
+.kimi-code/
+stderr.txt
+stdout.txt
