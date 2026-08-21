@@ -36,6 +36,9 @@ pypdf>=4.0.0
 # openai-whisper  # For OpenAI Whisper
 # faster-whisper  # For faster-whisper
 
+# Audio / Dubbing (v0.4 新增，从 ai-voice-dubber 合并)
+edge-tts>=6.1.0
+
 # ------------------------------------------------------------------
 # 本地模型依赖（v0.3 新增）
 # 推荐在 Python 3.11 + CUDA PyTorch 虚拟环境中安装：

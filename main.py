@@ -9,9 +9,19 @@ LLM-AutoCut: 基于大语言模型的影视后期智能剪辑系统
     python main.py --config config/config.yaml --phase 3
     python main.py --config config/config.yaml --phase 4
 """
-import argparse
-import os
 import sys
+import os
+
+# Windows 控制台默认使用 GBK，强制 UTF-8 避免中文日志乱码
+if sys.platform == "win32":
+    import io
+    if hasattr(sys.stdout, "buffer"):
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
+    if hasattr(sys.stderr, "buffer"):
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", line_buffering=True)
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
+import argparse
 import json
 
 # 确保 src 在路径中
@@ -27,6 +37,7 @@ from src.phase2_dedup import Phase2TakeSelector
 from src.phase2_inventory import MaterialInventoryBuilder
 from src.phase3_editor import Phase3Editor, EditDecision
 from src.phase4_exporter import Phase4Exporter
+from src.phase4_dubbing import Phase4Dubbing
 from src.services.llm_service import LLMService
 from src.services.script_service import ScriptPreprocessor, read_script_file, ScriptReadError, ScriptParseError
 
@@ -212,7 +223,7 @@ def main():
                 # 1) 优先从 --input-json 或 phase1_analysis.json 加载
                 input_path = args.input_json or os.path.join(output_dir, 'phase1_analysis.json')
                 if os.path.exists(input_path):
-                    with open(input_path, 'r') as f:
+                    with open(input_path, 'r', encoding='utf-8') as f:
                         data = json.load(f)
                     shots = [Shot.from_dict(s) for s in data.get('shots', [])]
                     logger.info(f"从文件加载 {len(shots)} 个镜头: {input_path}")
@@ -243,15 +254,21 @@ def main():
 
         elif phase == 3:
             if shots is None:
-                # Phase 3 依赖 Phase 1 的完整 Shot 对象
+                # Phase 3 优先使用 Phase 2 选择后的镜头状态，回退到 Phase 1
+                phase2_path = os.path.join(output_dir, 'phase2_selected_shots.json')
                 phase1_path = os.path.join(output_dir, 'phase1_analysis.json')
-                if not os.path.exists(phase1_path):
-                    print(f"错误: Phase 3 需要 Phase 1 的分析结果: {phase1_path}")
-                    sys.exit(1)
 
-                with open(phase1_path, 'r') as f:
-                    shots = [Shot.from_dict(s) for s in json.load(f).get('shots', [])]
-                logger.info(f"从 Phase 1 加载 {len(shots)} 个镜头用于剪辑决策")
+                if os.path.exists(phase2_path):
+                    with open(phase2_path, 'r', encoding='utf-8') as f:
+                        shots = [Shot.from_dict(s) for s in json.load(f).get('shots', [])]
+                    logger.info(f"从 Phase 2 加载 {len(shots)} 个带选择状态的镜头用于剪辑决策")
+                elif os.path.exists(phase1_path):
+                    with open(phase1_path, 'r', encoding='utf-8') as f:
+                        shots = [Shot.from_dict(s) for s in json.load(f).get('shots', [])]
+                    logger.warning(f"未找到 Phase 2 选择结果，从 Phase 1 回退加载 {len(shots)} 个镜头（状态均为候选）")
+                else:
+                    print(f"错误: Phase 3 需要 Phase 1/2 的分析结果: {phase1_path}")
+                    sys.exit(1)
 
             editor = Phase3Editor(config)
             decisions = editor.run(shots)
@@ -266,16 +283,33 @@ def main():
                     print("错误: Phase 4 需要 Phase 1 和 Phase 3 的结果，请按顺序运行")
                     sys.exit(1)
 
-                with open(phase1_path, 'r') as f:
-                    shots = [Shot.from_dict(s) for s in json.load(f).get('shots', [])]
+                phase2_path = os.path.join(output_dir, 'phase2_selected_shots.json')
+                if os.path.exists(phase2_path):
+                    with open(phase2_path, 'r', encoding='utf-8') as f:
+                        shots = [Shot.from_dict(s) for s in json.load(f).get('shots', [])]
+                else:
+                    with open(phase1_path, 'r', encoding='utf-8') as f:
+                        shots = [Shot.from_dict(s) for s in json.load(f).get('shots', [])]
 
-                with open(phase3_path, 'r') as f:
+                with open(phase3_path, 'r', encoding='utf-8') as f:
                     decisions = [EditDecision(**d) for d in json.load(f).get('timeline', [])]
 
                 logger.info(f"从文件加载 {len(shots)} 个镜头和 {len(decisions)} 个决策")
 
             exporter = Phase4Exporter(config)
             exporter.run(decisions, shots)
+
+            # Phase 4 扩展：配音配乐合成
+            audio_cfg = config.get("audio", {})
+            if audio_cfg.get("enabled", True):
+                try:
+                    dubbing = Phase4Dubbing(config)
+                    dubbing.run(shots, decisions)
+                except Exception as e:
+                    logger.error(f"Phase 4 配音配乐失败: {e}")
+                    logger.warning("已跳过配音配乐，基础导出文件仍然可用。")
+            else:
+                logger.info("Phase 4 配音配乐已禁用（config.audio.enabled=false）")
 
     logger.info("")
     logger.info("=" * 70)

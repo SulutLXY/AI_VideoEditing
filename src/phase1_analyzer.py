@@ -183,7 +183,7 @@ class Phase1Analyzer:
                 next_shot_id_func=self._next_shot_id,
                 shot_id=new_shot_id,
                 state="RAW",
-                cv_metadata=rough_shot.cv_metadata,
+                cv_meta=rough_shot.cv_metadata,
             )
             shots.extend(analyzed)
 

@@ -55,11 +55,28 @@ class Phase1AnalysisProcessor:
         filename = os.path.basename(video_path)
         logger.info(f"[Phase 1] 分析: {filename}")
 
-        # 1. CV 预扫描（若未传入则重新扫描）
+        # 1. CV 预扫描：必须用实际片段文件重新探测时长
+        #    避免 Phase 0 配置里残留的原始视频时长导致抽帧越界。
+        fresh_meta = cv_pre_scan(video_path)
         if cv_meta is None:
-            cv_meta = cv_pre_scan(video_path)
+            cv_meta = fresh_meta
+        else:
+            # 保留传入的 shot_config 等上下文，但用真实文件的时长/帧率覆盖
+            cv_meta = dict(cv_meta)
+            cv_meta.update({
+                "duration": fresh_meta.get("duration", 0.0),
+                "fps": fresh_meta.get("fps", 24.0),
+                "resolution": fresh_meta.get("resolution", cv_meta.get("resolution", (1920, 1080))),
+                "aspect_ratio": fresh_meta.get("aspect_ratio", cv_meta.get("aspect_ratio", "16:9")),
+                "bitrate": fresh_meta.get("bitrate", cv_meta.get("bitrate")),
+                "codec": fresh_meta.get("codec", cv_meta.get("codec")),
+                "visual_quality": fresh_meta.get("visual_quality", cv_meta.get("visual_quality")),
+            })
         fps = cv_meta.get("fps", 24.0)
         duration = cv_meta.get("duration", 0.0)
+        if duration <= 0:
+            logger.error(f"[Phase 1] 无法获取视频时长，跳过: {video_path}")
+            return []
 
         # 2. VLM 采样 + 分析
         frames = self.vlm_service.sample_frames(video_path, duration, self.temp_dir)

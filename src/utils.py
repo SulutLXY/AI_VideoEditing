@@ -38,9 +38,23 @@ from src.models import (
 logger = logging.getLogger(__name__)
 
 
+class _Utf8StreamHandler(logging.StreamHandler):
+    """强制使用 UTF-8 输出的 StreamHandler，解决 Windows 控制台日志乱码"""
+
+    def __init__(self):
+        import sys
+        import io
+        # 将 sys.stdout 包装为 UTF-8 编码，避免中文在控制台输出乱码
+        try:
+            stream = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
+        except Exception:
+            stream = sys.stdout
+        super().__init__(stream)
+
+
 def init_logging(output_dir: Optional[str] = None):
     """初始化日志，确保输出目录存在后调用"""
-    handlers = [logging.StreamHandler()]
+    handlers = [_Utf8StreamHandler()]
     if output_dir:
         log_path = os.path.join(output_dir, "logs", "pipeline.log")
         ensure_dir(os.path.dirname(log_path))

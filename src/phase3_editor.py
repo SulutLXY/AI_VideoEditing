@@ -21,6 +21,7 @@ from typing import List, Dict, Optional
 from dataclasses import dataclass, asdict
 
 from src.utils import Shot, save_json, load_json, logger, parse_duration_string
+from src.services.llm_service import LLMService
 
 
 @dataclass
@@ -57,7 +58,7 @@ class Phase3Editor:
         self.target_max = self.target_duration * 1.05 if self.target_duration else float('inf')
 
         self.prompt_template = self._load_prompt_template()
-        self.llm_client = self._init_llm_client()
+        self.llm_service = LLMService(config)
 
     def _load_prompt_template(self) -> str:
         """加载 Prompt 模板，失败时回退到内置最小模板"""
@@ -73,19 +74,6 @@ class Phase3Editor:
     @staticmethod
     def _fallback_prompt_template() -> str:
         return """你是一位资深电影剪辑师。\n## 项目信息\n- 片名: {project_name}\n- 风格: {project_style}\n- 类型: {project_genre}\n- 目标时长: {target_duration}s\n- 允许区间: {target_duration_min}s ~ {target_duration_max}s\n- 当前核心镜头总时长: {current_core_duration}s\n\n## 剪辑语法参考\n- 升格(慢动作, 40%-80%): 情绪高潮、关键动作细节。要求素材帧率≥60fps\n- 降格(快动作, 200%-600%): 压缩时间、过渡段落\n- 原速(1x): 正常叙事\n\n### 剪辑手法\n连续剪辑/J-Cut/L-Cut/交叉/跳切/匹配剪辑/反应镜头插入\n\n### 转场\n硬切/叠化/闪白/闪黑/黑场\n\n### 音频\n保留原声/J-Cut/L-Cut/配乐覆盖/音效强化\n\n## 前期预警\n{warnings_text}\n\n## 待决策核心镜头\n{shots_text}\n\n## 补充镜头池（时长不足时可选）\n{supplement_text}\n\n## 任务\n为每个镜头做出剪辑决策，输出 JSON 数组:\n[\n  {{\n    \"shot_id\": \"S001\",\n    \"keep\": true,\n    \"speed\": \"1x 或 50% 或 200%\",\n    \"speed_reason\": \"\",\n    \"technique\": \"\",\n    \"technique_reason\": \"\",\n    \"transition\": \"\",\n    \"audio\": \"\",\n    \"audio_reason\": \"\",\n    \"purpose\": \"\",\n    \"notes\": \"\"\n  }}\n]\n\n注意:\n1. keep=false 表示删除；keep=true 表示保留。\n2. 总时长必须落在允许区间内，超出时请优先变速，仍不足或超出请参考补充镜头池。\n3. 相邻镜头节奏要有变化。\n4. 特殊升格镜头不要连续使用 3 个以上。\n5. 只输出 JSON。"""
-
-    def _init_llm_client(self):
-        """初始化 LLM 客户端"""
-        import openai
-        provider = self.models['llm']['provider']
-        base_url = self.models['llm'].get('base_url')
-        if provider == 'deepseek':
-            base_url = base_url or "https://api.deepseek.com"
-
-        return openai.OpenAI(
-            api_key=self.models['llm']['api_key'],
-            base_url=base_url
-        )
 
     # ------------------------------------------------------------------
     # 主入口
@@ -257,28 +245,23 @@ class Phase3Editor:
         supplement_text = self._build_supplement_text(supplement_shots)
         current_core_duration = sum(s.duration_sec for s in shots)
 
-        prompt = self.prompt_template.format(
-            project_name=self.project.get('name', '未命名'),
-            project_style=self.project.get('style', ''),
-            project_genre=self.project.get('genre', '剧情短片'),
-            target_duration=f"{self.target_duration:.1f}",
-            target_duration_min=f"{self.target_min:.1f}",
-            target_duration_max=f"{self.target_max:.1f}",
-            current_core_duration=f"{current_core_duration:.1f}",
-            warnings_text=warnings_text,
-            shots_text=shots_text,
-            supplement_text=supplement_text,
+        # 使用 replace 避免模板中 JSON 花括号被 format 误解析为占位符
+        prompt = (
+            self.prompt_template
+            .replace("{project_name}", self.project.get('name', '未命名'))
+            .replace("{project_style}", self.project.get('style', ''))
+            .replace("{project_genre}", self.project.get('genre', '剧情短片'))
+            .replace("{target_duration}", f"{self.target_duration:.1f}")
+            .replace("{target_duration_min}", f"{self.target_min:.1f}")
+            .replace("{target_duration_max}", f"{self.target_max:.1f}")
+            .replace("{current_core_duration}", f"{current_core_duration:.1f}")
+            .replace("{warnings_text}", warnings_text)
+            .replace("{shots_text}", shots_text)
+            .replace("{supplement_text}", supplement_text)
         )
 
         try:
-            response = self.llm_client.chat.completions.create(
-                model=self.models['llm']['model'],
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=self.models['llm'].get('max_tokens', 8192),
-                temperature=0.4
-            )
-
-            content = response.choices[0].message.content
+            content = self.llm_service.generate(prompt)
             # 提取 JSON
             if '```json' in content:
                 content = content.split('```json')[1].split('```')[0]
@@ -567,10 +550,15 @@ class Phase3Editor:
         # 第二阶段：从备选池补充镜头
         if deficit > 0 and supplement_shots:
             supplement_shots = self._sort_by_narrative(supplement_shots)
+            used_source_files = {d.source_file for d in decisions}
             for sup in supplement_shots:
                 if deficit <= 0:
                     break
                 if any(d.shot_id == sup.shot_id for d in decisions):
+                    continue
+
+                # 避免同一原始素材多次出现，防止画面重复
+                if sup.source_file in used_source_files:
                     continue
 
                 sup_dur = sup.duration_sec
@@ -591,6 +579,7 @@ class Phase3Editor:
                     purpose="补充时长 / 缺失情节点",
                     notes="由时长不足自动从备选池补充",
                 ))
+                used_source_files.add(sup.source_file)
                 total = self._projected_duration(decisions, shots)
                 deficit = self.target_min - total
 

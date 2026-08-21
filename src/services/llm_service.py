@@ -7,6 +7,7 @@ LLM（大语言模型）服务层
 - 统一处理 JSON 提取
 """
 import json
+import os
 from typing import List, Dict, Any
 
 from src.models import Shot, ScriptBeat
@@ -24,6 +25,23 @@ class LLMService:
         self.temperature = self.config.get("temperature", 0.3)
         self.client = self._init_client()
 
+    def _resolve_api_key(self) -> str:
+        """按优先级解析 API Key：配置 > 环境变量"""
+        api_key = self.config.get("api_key", "")
+        if api_key:
+            return api_key
+
+        env_map = {
+            "openai": "OPENAI_API_KEY",
+            "deepseek": "DEEPSEEK_API_KEY",
+            "doubao": "ARK_API_KEY",
+            "volcengine": "ARK_API_KEY",
+            "qwen": "DASHSCOPE_API_KEY",
+            "custom": "OPENAI_API_KEY",
+        }
+        env_name = env_map.get(self.provider, "OPENAI_API_KEY")
+        return os.environ.get(env_name, "")
+
     def _init_client(self):
         """初始化 LLM 客户端。支持 OpenAI、DeepSeek、豆包/火山方舟等 OpenAI 兼容接口。"""
         openai_compatible_providers = {"openai", "deepseek", "doubao", "qwen", "volcengine", "custom"}
@@ -32,8 +50,16 @@ class LLMService:
             base_url = self.config.get("base_url")
             if self.provider == "deepseek" and not base_url:
                 base_url = "https://api.deepseek.com"
+
+            api_key = self._resolve_api_key()
+            if not api_key:
+                raise RuntimeError(
+                    f"LLM provider '{self.provider}' 缺少 API Key。请在 config.yaml 中设置 models.llm.api_key "
+                    f"或设置环境变量 {env_map.get(self.provider, 'OPENAI_API_KEY')}。"
+                )
+
             return openai.OpenAI(
-                api_key=self.config.get("api_key"),
+                api_key=api_key,
                 base_url=base_url,
             )
         raise NotImplementedError(f"LLM provider {self.provider} 尚未实现")
@@ -112,21 +138,62 @@ class LLMService:
         template = self._load_prompt_template(
             "phase2_match",
             "你是一位资深剪辑指导，擅长将片场素材映射到剧本结构。\n\n## 剧本大纲\n{beats_text}\n\n## 待匹配镜头\n{shots_text}\n\n"
-            "将每个镜头匹配到最合适的剧本情节点，输出 JSON 数组，字段：beat, act, function, confidence, reasoning。无法匹配时 beat 为 UNMATCHED。只输出 JSON。",
+            "将每个镜头匹配到最合适的剧本情节点，输出 JSON 数组，字段：shot_id, beat, act, function, confidence, reasoning。无法匹配时 beat 为 UNMATCHED。只输出 JSON。",
         )
 
+        def _normalize_anchors(raw: Any, batch: List[Shot]) -> List[Dict[str, Any]]:
+            """把 LLM 各种奇形怪状的返回统一成 List[Dict]"""
+            if raw is None:
+                return []
+            if isinstance(raw, dict):
+                # 情况1: {"S001": {...}, "S002": {...}}
+                if all(isinstance(v, dict) for v in raw.values()):
+                    result = []
+                    for k, v in raw.items():
+                        v["shot_id"] = v.get("shot_id") or k
+                        result.append(v)
+                    return result
+                # 情况2: {"results": [...]} / {"anchors": [...]} / {"data": [...]}
+                for key in ("results", "anchors", "data", "shots"):
+                    if key in raw and isinstance(raw[key], list):
+                        return raw[key]
+                # 情况3: 单条对象被包在 dict 里
+                if "beat" in raw or "shot_id" in raw:
+                    return [raw]
+                return []
+            if isinstance(raw, list):
+                return raw
+            return []
+
         anchor_map = {}
-        batch_size = 20
+        batch_size = 15  # 减小批次，降低模型混淆概率
         for batch_start in range(0, len(shots), batch_size):
             batch = shots[batch_start:batch_start + batch_size]
             shots_text = "\n\n".join([self._shot_config_text(s) for s in batch])
 
-            prompt = template.format(beats_text=beats_text, shots_text=shots_text)
+            # 用 replace 而非 format，避免模板中 JSON 花括号被误解析为占位符
+            prompt = template.replace("{beats_text}", beats_text).replace("{shots_text}", shots_text)
 
             try:
                 content = self._call(prompt)
-                anchors = self._extract_json(content)
-                for a in anchors:
+                raw = self._extract_json(content)
+                anchors = _normalize_anchors(raw, batch)
+
+                if not anchors:
+                    logger.warning(f"LLM 返回的锚定结果无法解析为列表 (batch {batch_start})，原始内容前 500 字: {content[:500]}")
+
+                for idx, a in enumerate(anchors):
+                    if not isinstance(a, dict):
+                        logger.warning(f"LLM 返回的第 {idx} 个锚定项不是字典，跳过: {a}")
+                        continue
+                    shot_id = a.get("shot_id") or a.get("id")
+                    # 如果缺少 shot_id，按顺序用本 batch 的 shot_id 回填
+                    if not shot_id and idx < len(batch):
+                        shot_id = batch[idx].shot_id
+                        logger.debug(f"LLM 返回缺少 shot_id，按 batch 顺序回填为 {shot_id}")
+                    if not shot_id:
+                        logger.warning(f"LLM 返回的锚定结果缺少 shot_id 且无法回填，跳过: {a}")
+                        continue
                     # 统一字段名（兼容旧版 matched_beat / matched_act）
                     anchor = {
                         "beat": a.get("beat") or a.get("matched_beat", "UNMATCHED"),
@@ -135,9 +202,10 @@ class LLMService:
                         "confidence": float(a.get("confidence", 0.0) or 0.0),
                         "reasoning": a.get("reasoning", ""),
                     }
-                    anchor_map[a["shot_id"]] = anchor
+                    anchor_map[shot_id] = anchor
             except Exception as e:
                 logger.error(f"LLM 锚定失败 (batch {batch_start}): {e}")
+                logger.error(f"原始返回内容前 1000 字: {content[:1000] if 'content' in locals() else 'N/A'}")
                 for shot in batch:
                     anchor_map[shot.shot_id] = {
                         "beat": "ERROR",

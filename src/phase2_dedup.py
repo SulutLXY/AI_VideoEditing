@@ -121,6 +121,11 @@ class Phase2TakeSelector:
         save_json(report, os.path.join(self.output_dir, "phase2_deduplication.json"))
         self._export_csv(shots, report)
 
+        # 9. 同时保存带状态/锚定信息的 Shot 列表，供 Phase 3 使用
+        selected_shots_path = os.path.join(self.output_dir, "phase2_selected_shots.json")
+        save_json({"shots": [s.to_dict() for s in shots]}, selected_shots_path)
+        logger.info(f"已保存 Phase 2 选择后的镜头列表: {selected_shots_path}")
+
         selected = [s for s in shots if s.status in ["核心", "保留", "备选", "强制保留", "待复核"]]
         logger.info(f"Phase 2 完成: 选中 {len(selected)}/{len(shots)} 个镜头")
         logger.info(f"  核心: {len([s for s in shots if s.status == '核心'])}")
