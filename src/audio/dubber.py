@@ -561,13 +561,19 @@ class Dubber:
             return temp_segments[0]
 
         # concat demuxer 拼接
+        # 使用相对于 concat list 的相对路径，避免 ffmpeg 把 temp/video_segment_000.mp4
+        # 解析成 temp/temp/video_segment_000.mp4
         concat_file = str(self.temp_dir / "video_concat_list.txt")
         with open(concat_file, "w", encoding="utf-8") as f:
             for seg in temp_segments:
-                f.write(f"file '{seg.replace(chr(92), '/')}'\n")
+                rel_seg = os.path.relpath(seg, self.temp_dir).replace(chr(92), "/")
+                f.write(f"file '{rel_seg}'\n")
 
-        merged = str(self.temp_dir / "merged_video.mp4")
-        subprocess.run([
+        # 使用带时间戳的文件名，避免被上一次运行残留的 merged_video.mp4 误导
+        import time
+        merged = str(self.temp_dir / f"merged_video_{int(time.time())}.mp4")
+
+        result = subprocess.run([
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             "-f", "concat", "-safe", "0",
             "-i", concat_file,
@@ -575,6 +581,18 @@ class Dubber:
             merged,
         ], capture_output=True, check=False)
 
-        if Path(merged).exists():
-            return merged
-        return None
+        if result.returncode != 0:
+            logger.error(f"[Dubber] 视频拼接失败: {result.stderr.decode('utf-8', errors='ignore')[:500]}")
+            return None
+
+        if not Path(merged).exists():
+            return None
+
+        # 简单校验：合并后时长应接近各片段变速后时长之和
+        merged_duration = self._get_audio_duration(merged)
+        expected = sum(item.get("duration_sec", 0.0) for item in valid_items)
+        if merged_duration < expected * 0.5:
+            logger.warning(f"[Dubber] 合并后视频时长异常: {merged_duration:.2f}s, 预期约 {expected:.2f}s")
+            return None
+
+        return merged
