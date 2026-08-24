@@ -17,7 +17,7 @@ v0.2 重构目标：
 """
 import hashlib
 import os
-from typing import List, Dict, Tuple, Set
+from typing import List, Dict, Tuple, Set, Optional
 from collections import defaultdict
 
 from src.models import Shot, ScriptBeat
@@ -54,7 +54,12 @@ class Phase2TakeSelector:
         except Exception as e:
             logger.warning(f"CLIP 加载失败，L3 语义去重将不可用: {e}")
 
-    def run(self, shots: List[Shot], script_beats: List[ScriptBeat]) -> Tuple[List[Shot], Dict]:
+    def run(
+        self,
+        shots: List[Shot],
+        script_beats: List[ScriptBeat],
+        beat_analysis: Optional[Dict[str, Dict]] = None,
+    ) -> Tuple[List[Shot], Dict]:
         """执行 Phase 2 镜头选择"""
         logger.info("=" * 60)
         logger.info("Phase 2: 镜头选择 + 去重 + 覆盖检测")
@@ -69,7 +74,7 @@ class Phase2TakeSelector:
         # 0. 用 DeepSeek 做剧本-镜头语义锚定（Phase 1 不再负责剧本锚定）
         logger.info(f"Phase 2: 调用 LLM 对 {len(shots)} 个镜头进行剧本锚定...")
         try:
-            anchor_map = self.llm_service.anchor_shots_to_script(shots, script_beats)
+            anchor_map = self.llm_service.anchor_shots_to_script(shots, script_beats, beat_analysis)
         except Exception as e:
             logger.error(f"Phase 2 LLM 锚定调用失败: {e}")
             anchor_map = {}
@@ -88,6 +93,14 @@ class Phase2TakeSelector:
                 }
         matched = sum(1 for s in shots if s.script_anchor.get("beat") not in ["UNMATCHED", "ERROR"])
         logger.info(f"剧本锚定完成: {matched}/{len(shots)} 个镜头匹配到情节点")
+
+        # 按 beat 统计匹配分布，便于快速核对
+        beat_counts: Dict[str, int] = {}
+        for s in shots:
+            beat = s.script_anchor.get("beat", "UNMATCHED")
+            beat_counts[beat] = beat_counts.get(beat, 0) + 1
+        for beat_id in sorted(beat_counts.keys(), key=lambda x: (x == "UNMATCHED", x)):
+            logger.info(f"  - {beat_id}: {beat_counts[beat_id]} 个镜头")
 
         # 1. 计算质量分
         self._compute_quality_scores(shots)
@@ -178,10 +191,15 @@ class Phase2TakeSelector:
     # ------------------------------------------------------------------
     def _l1_file_dedup(self, shots: List[Shot]) -> None:
         """基于文件 MD5 的完全重复检测。保留质量分最高的副本；
-        PROCESSED/ANALYZED 优先于 RAW。"""
+        PROCESSED/ANALYZED 优先于 RAW。\n
+        注意：RAW 素材被 Phase 0 粗剪后，多个片段可能共享同一个 source_path（原始视频），
+        因此优先使用 split_clip_path（实际片段文件）计算 MD5，避免把不同粗剪片段误判为重复。
+        """
         md5_groups: Dict[str, List[Shot]] = defaultdict(list)
         for shot in shots:
-            file_path = shot.source_path
+            # 优先使用实际片段文件路径
+            cfg = (shot.cv_metadata or {}).get("shot_config", {})
+            file_path = cfg.get("split_clip_path") or cfg.get("clip_path") or shot.source_path
             if not file_path or not os.path.exists(file_path):
                 continue
             try:
@@ -262,7 +280,18 @@ class Phase2TakeSelector:
         return protected + candidates
 
     def _are_related(self, shot1: Shot, shot2: Shot) -> bool:
-        """判断两个 Shot 是否强关联（不应判重）"""
+        """
+        判断两个 Shot 是否强关联（不应判重）。
+
+        强关联条件（满足其一即不判重）：
+        1. 同一 shot_id
+        2. 关系图直接关联且连贯性高（coherence_score >= 0.6）
+        3. 关系类型为强连贯（情绪延续 / 动作衔接 / 对话衔接）
+        4. 同一源文件且时间相邻，并且内容明显连续（continuity_score 高）——长镜头拆分保护
+        5. 同角色且方向明显冲突（越轴风险），应保留供人工判断
+
+        注意：同一源文件不再无条件保护，只有真正连续的长镜头拆分才保护。
+        """
         # 同一镜头
         if shot1.shot_id == shot2.shot_id:
             return True
@@ -279,9 +308,23 @@ class Phase2TakeSelector:
             if rel and rel.shot_id == shot2.shot_id and rel.relationship_type in ["情绪延续", "动作衔接", "对话衔接"]:
                 return True
 
-        # 来自同一源文件且时间相邻（可能是长镜头拆分）
-        if shot1.source_file == shot2.source_file and shot1.source_path == shot2.source_path:
-            return True
+        # 来自同一源文件且时间相邻：只有真正连续的长镜头拆分才保护
+        if (shot1.source_file == shot2.source_file
+                and shot1.source_path == shot2.source_path):
+            # 判断时间是否相邻（间隔 < 0.5 秒）
+            try:
+                from src.utils import tc_to_sec
+                end1 = tc_to_sec(shot1.tc_out, shot1.fps)
+                start2 = tc_to_sec(shot2.tc_in, shot2.fps)
+                end2 = tc_to_sec(shot2.tc_out, shot2.fps)
+                start1 = tc_to_sec(shot2.tc_in, shot2.fps)
+                gap = min(abs(start2 - end1), abs(start1 - end2))
+                if gap < 0.5:
+                    # 必须内容连续（continuity_score 高 或 action 明显连续）
+                    if max(shot1.continuity_score or 0.0, shot2.continuity_score or 0.0) >= 0.7:
+                        return True
+            except Exception:
+                pass
 
         # 同角色且方向明显冲突：可能是越轴镜头，不应判重，应保留供人工判断
         if self._are_directions_conflicting(shot1, shot2):
@@ -462,26 +505,50 @@ class Phase2TakeSelector:
     # 核心 take 选择
     # ------------------------------------------------------------------
     def _select_takes(self, beat_groups: Dict[str, List[Shot]]) -> Dict[str, Dict]:
-        """为每个情节点选择核心 take：质量分最高者即为核心，不区分 RAW/PROCESSED/ANALYZED"""
+        """
+        为每个情节点选择核心 take：按质量分排序，选 top-k 作为核心。
+
+        规则：
+        - 每组最多选 3 个核心（避免同一剧情点镜头过多）。
+        - 同一 source_file 在同一 beat 内最多出现 1 次核心（避免同一原素材重复）。
+        - 其余 alive 镜头标记为备选。
+        """
         selections = {}
+        max_core_per_beat = self.config.get("phase2", {}).get("max_core_per_beat", 3)
 
         for beat_id, group in beat_groups.items():
             # 过滤掉已废弃的
             alive = [s for s in group if s.status != "废弃"]
             if not alive:
-                selections[beat_id] = {"core": None, "shots": [s.shot_id for s in group]}
+                selections[beat_id] = {"core": [], "shots": [s.shot_id for s in group]}
                 continue
 
-            # 按质量分排序，最高分即为核心
+            # 按质量分排序
             alive_sorted = sorted(alive, key=lambda s: s.quality_score, reverse=True)
-            core = alive_sorted[0]
-
-            # 核心状态统一为「核心」，其余保持原来的强制保留/待复核状态或标记为备选
-            core.status = "核心"
-            core.dedup_reason = f"该情节点最优 take，质量分 {core.quality_score}"
+            cores = []
+            used_source_files = set()
 
             for shot in alive_sorted:
-                if shot.shot_id == core.shot_id:
+                if len(cores) >= max_core_per_beat:
+                    break
+                # 保护状态镜头优先作为核心
+                if shot.status in ["强制保留", "待复核"]:
+                    shot.status = "核心"
+                    shot.dedup_reason = f"受保护素材作为核心，质量分 {shot.quality_score}"
+                    cores.append(shot)
+                    used_source_files.add(shot.source_file)
+                    continue
+                # 同一 source_file 不重复作为核心
+                if shot.source_file in used_source_files:
+                    continue
+                shot.status = "核心"
+                shot.dedup_reason = f"该情节点核心 take，质量分 {shot.quality_score}"
+                cores.append(shot)
+                used_source_files.add(shot.source_file)
+
+            # 其余标记为备选
+            for shot in alive_sorted:
+                if shot in cores:
                     continue
                 if shot.status == "强制保留":
                     shot.dedup_reason = f"PROCESSED 素材保留，质量分 {shot.quality_score}"
@@ -492,7 +559,7 @@ class Phase2TakeSelector:
                     shot.dedup_reason = f"同组备选，质量分 {shot.quality_score}"
 
             selections[beat_id] = {
-                "core": core.shot_id,
+                "core": [s.shot_id for s in cores],
                 "shots": [s.shot_id for s in alive],
                 "script_beat": self._script_beats.get(beat_id, ScriptBeat("", "", beat_id, "", "", "", "")).to_dict(),
             }

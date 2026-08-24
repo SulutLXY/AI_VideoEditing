@@ -50,10 +50,20 @@ class Phase1AnalysisProcessor:
         shot_id: Optional[str] = None,
         state: str = "RAW",
         cv_meta: Optional[Dict[str, Any]] = None,
+        source_file: Optional[str] = None,
+        source_path: Optional[str] = None,
     ) -> List[Shot]:
-        """分析单个视频片段，返回完整 Shot"""
+        """分析单个视频片段，返回完整 Shot
+
+        当分析的是 Phase 0 粗剪片段时，必须传入原始 source_file/source_path，
+        否则 source_file 会被错误地记录为片段文件名（如 S086.mp4）。
+        """
         filename = os.path.basename(video_path)
         logger.info(f"[Phase 1] 分析: {filename}")
+        if source_file is None:
+            source_file = filename
+        if source_path is None:
+            source_path = os.path.abspath(video_path)
 
         # 1. CV 预扫描：必须用实际片段文件重新探测时长
         #    避免 Phase 0 配置里残留的原始视频时长导致抽帧越界。
@@ -109,8 +119,8 @@ class Phase1AnalysisProcessor:
         shot = Shot(
             shot_id=shot_id,
             state=state,
-            source_file=filename,
-            source_path=os.path.abspath(video_path),
+            source_file=source_file,
+            source_path=source_path,
             tc_in=sec_to_tc(0.0, fps),
             tc_out=sec_to_tc(duration, fps),
             duration_sec=duration,
@@ -142,6 +152,10 @@ class Phase1AnalysisProcessor:
             action_details=description.get("action_details", ""),
             continuity_score=float(description.get("continuity_score", 0.0) or 0.0),
             continuity_notes=description.get("continuity_notes", ""),
+            behavior=description.get("behavior", ""),
+            pace=description.get("pace", ""),
+            emotion_intensity=float(description.get("emotion_intensity", 0.0) or 0.0),
+            primary_subject=description.get("primary_subject", ""),
             visual_quality=cv_meta.get("visual_quality"),
             do_not_split=True,
             needs_review=False,
@@ -195,6 +209,10 @@ class Phase1AnalysisProcessor:
             "action_details": description.get("action_details", ""),
             "continuity_score": float(description.get("continuity_score", 0.0) or 0.0),
             "continuity_notes": description.get("continuity_notes", ""),
+            "behavior": description.get("behavior", ""),
+            "pace": description.get("pace", ""),
+            "emotion_intensity": float(description.get("emotion_intensity", 0.0) or 0.0),
+            "primary_subject": description.get("primary_subject", ""),
             "is_long_take": False,
             "coherence_score": 0.0,
         }

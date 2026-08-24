@@ -184,6 +184,8 @@ class Phase1Analyzer:
                 shot_id=new_shot_id,
                 state="RAW",
                 cv_meta=rough_shot.cv_metadata,
+                source_file=rough_shot.source_file,
+                source_path=rough_shot.source_path,
             )
             shots.extend(analyzed)
 
@@ -256,10 +258,17 @@ class Phase1Analyzer:
         return rough_shot.source_path
 
     def _collect_videos(self) -> List[Tuple[str, str, Optional[str]]]:
-        """收集所有视频任务及其状态"""
+        """收集所有视频任务及其状态
+
+        如果已存在 Phase 0 粗剪结果，则只收集粗剪配置中实际包含的 source_file，
+        避免 E/F/G 等剧情终点之后的素材进入 Phase 1 分析。
+        同时按 source_file 去重，防止 workspace/materials/raw 与 raw_materials
+        指向同批素材副本时重复分析。
+        """
         tasks = []
         overrides = self.config.get("materials_overrides", [])
-        seen = set()
+        seen_path = set()
+        seen_source = set()
 
         material_dirs = []
         for item in self.materials_config:
@@ -274,6 +283,17 @@ class Phase1Analyzer:
             logger.warning("未配置任何素材目录")
             return tasks
 
+        # 若存在 Phase 0 配置，仅保留配置里出现的 source_file
+        rough_config_path = os.path.join(self.output_dir, "phase0_rough_config.json")
+        allowed_sources: Optional[set] = None
+        if os.path.exists(rough_config_path):
+            try:
+                rough_cfg = load_json(rough_config_path)
+                allowed_sources = set(rough_cfg.get("assets", {}).keys())
+                logger.info(f"[Phase 1] 根据 Phase 0 配置限定素材范围: {len(allowed_sources)} 个源文件")
+            except Exception as e:
+                logger.warning(f"[Phase 1] 读取 Phase 0 配置失败，将扫描全部素材: {e}")
+
         for directory in material_dirs:
             if not os.path.exists(directory):
                 logger.warning(f"素材目录不存在: {directory}")
@@ -282,10 +302,20 @@ class Phase1Analyzer:
             video_files = get_video_files(directory)
             for video_path in video_files:
                 abs_path = os.path.abspath(video_path)
-                if abs_path in seen:
+                if abs_path in seen_path:
                     continue
-                seen.add(abs_path)
+                seen_path.add(abs_path)
 
+                source_name = os.path.basename(abs_path)
+                if source_name in seen_source:
+                    logger.info(f"[Phase 1] 跳过重复素材: {source_name}")
+                    continue
+
+                if allowed_sources is not None and source_name not in allowed_sources:
+                    logger.info(f"[Phase 1] 跳过 Phase 0 配置外的素材: {source_name}")
+                    continue
+
+                seen_source.add(source_name)
                 state, item = resolve_material_state(abs_path, self.materials_config, overrides)
                 meta_format = item.get("meta_format") if state == "ANALYZED" else None
                 tasks.append((abs_path, state, meta_format))

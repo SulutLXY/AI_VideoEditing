@@ -93,9 +93,20 @@ class ScriptBeat:
     emotion: str
     key_actions: List[str] = field(default_factory=list)
     key_dialogue: str = ""
+    # 由 LLM 剧情节奏分析填充
+    estimated_duration: float = 0.0          # 该 beat 建议时长（秒）
+    pace: str = "正常"                        # 节奏标签：爆发/快/正常/慢/静止
+    emotion_intensity: float = 0.0           # 情绪强度 0-5
+    priority: int = 3                        # 剧情重要性 1-5，5 最高
+    required_shots_count: int = 1            # 建议最少镜头数
 
     def to_dict(self):
         return asdict(self)
+
+    @property
+    def numeric_weight(self) -> float:
+        """综合权重：priority + emotion_intensity，用于全局时长分配校验"""
+        return float(self.priority) + float(self.emotion_intensity)
 
 
 @dataclass
@@ -145,6 +156,12 @@ class Segment:
     action_details: str = ""          # 动作细节描述
     continuity_score: float = 0.0     # 镜头内部连续性评分 (0-1)，越高越连贯
     continuity_notes: str = ""      # 连续性说明
+
+    # 新增：行为 / 节奏 / 主体
+    behavior: str = ""              # 主体行为自由描述
+    pace: str = ""                    # 节奏标签：爆发/快/正常/慢/静止
+    emotion_intensity: float = 0.0   # 情绪强度 0-5
+    primary_subject: str = ""         # 画面主体
 
     # 风格/氛围/文化
     style: str = ""
@@ -218,6 +235,12 @@ class Shot:
     action_details: str = ""          # 动作细节
     continuity_score: float = 0.0     # 镜头内部连续性评分 (0-1)
     continuity_notes: str = ""      # 连续性说明
+
+    # 新增：行为 / 节奏 / 主体 / 情绪强度
+    behavior: str = ""                # 主体行为自由描述（如：奔跑追猫、跃起变身、接抱安抚）
+    pace: str = ""                    # 节奏标签：爆发/快/正常/慢/静止
+    emotion_intensity: float = 0.0   # 情绪强度 0-5
+    primary_subject: str = ""         # 画面主体（如云琛、黑猫、小六）
 
     # 质量评估
     visual_quality: Optional[float] = None
@@ -305,6 +328,10 @@ class Shot:
             action_details=pick("action_details", ""),
             continuity_score=pick("continuity_score", 0.0),
             continuity_notes=pick("continuity_notes", ""),
+            behavior=pick("behavior", ""),
+            pace=pick("pace", ""),
+            emotion_intensity=float(pick("emotion_intensity", 0.0) or 0.0),
+            primary_subject=pick("primary_subject", ""),
             visual_quality=pick("visual_quality"),
             stability=pick("stability"),
             exposure=pick("exposure"),
@@ -365,6 +392,10 @@ class Shot:
             "action_details": self.action_details,
             "continuity_score": self.continuity_score,
             "continuity_notes": self.continuity_notes,
+            "behavior": self.behavior,
+            "pace": self.pace,
+            "emotion_intensity": self.emotion_intensity,
+            "primary_subject": self.primary_subject,
         }
 
     @vlm_description.setter
@@ -399,3 +430,7 @@ class Shot:
         self.action_details = value.get("action_details", self.action_details)
         self.continuity_score = value.get("continuity_score", self.continuity_score)
         self.continuity_notes = value.get("continuity_notes", self.continuity_notes)
+        self.behavior = value.get("behavior", self.behavior)
+        self.pace = value.get("pace", self.pace)
+        self.emotion_intensity = float(value.get("emotion_intensity", self.emotion_intensity) or 0.0)
+        self.primary_subject = value.get("primary_subject", self.primary_subject)

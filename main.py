@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.utils import (
     load_config, parse_script_outline, logger, ensure_dir,
     init_logging, Shot, get_video_files, save_json,
+    parse_duration_string,
 )
 from src.phase0_rough_cut import RoughCutAnalyzer
 from src.phase1_analyzer import Phase1Analyzer
@@ -163,6 +164,19 @@ def main():
 
     phases_to_run = [0, 1, 2, 3, 4] if run_all else [run_phase]
 
+    # 若后续阶段依赖剧本，提前统一加载，避免单独跑 Phase 3/4 时丢失剧本信息
+    if any(p >= 2 for p in phases_to_run):
+        script_path = config['paths']['script_outline']
+        if os.path.exists(script_path) and script_beats is None:
+            logger.info(f"预加载剧本大纲: {script_path}")
+            script_beats = parse_script_outline(script_path)
+            if script_beats:
+                logger.info(f"剧本解析完成: {len(script_beats)} 个情节点")
+                for beat in script_beats:
+                    logger.info(f"  - {beat.act} / {beat.beat_id}: {beat.content[:40]}...")
+            else:
+                logger.warning("未能从剧本大纲解析出任何情节点，后续阶段可能无法生成剧本驱动配音")
+
     # 执行各阶段
     shots = None
     decisions = None
@@ -219,6 +233,34 @@ def main():
                 for beat in script_beats:
                     logger.info(f"  - {beat.act} / {beat.beat_id}: {beat.content[:40]}...")
 
+                # 用 LLM 分析剧本节奏，为每个 beat 分配目标时长
+                try:
+                    llm_service = LLMService(config)
+                    target_duration = parse_duration_string(config['project'].get('target_duration', 0))
+                    beat_analysis = llm_service.analyze_script_beats(script_beats, target_duration)
+                    if beat_analysis:
+                        for beat in script_beats:
+                            info = beat_analysis.get(beat.beat_id)
+                            if info:
+                                beat.estimated_duration = info.get("estimated_duration", 0.0)
+                                beat.pace = info.get("pace", "正常")
+                                beat.emotion_intensity = info.get("emotion_intensity", 0.0)
+                                beat.priority = info.get("priority", 3)
+                                beat.required_shots_count = info.get("required_shots_count", 1)
+                        save_json(
+                            {"beats": [b.to_dict() for b in script_beats], "analysis": beat_analysis},
+                            os.path.join(output_dir, 'script_beats_analysis.json')
+                        )
+                        logger.info(f"剧本节奏分析完成，已保存: {os.path.join(output_dir, 'script_beats_analysis.json')}")
+                        logger.info("各 beat 目标时长分配:")
+                        for beat in script_beats:
+                            logger.info(
+                                f"  - {beat.beat_id}: {beat.estimated_duration:.1f}s, "
+                                f"节奏={beat.pace}, 优先级={beat.priority}, 情绪={beat.emotion_intensity:.1f}"
+                            )
+                except Exception as e:
+                    logger.warning(f"剧本节奏分析失败，将使用平均时长分配: {e}")
+
             if shots is None:
                 # 1) 优先从 --input-json 或 phase1_analysis.json 加载
                 input_path = args.input_json or os.path.join(output_dir, 'phase1_analysis.json')
@@ -250,7 +292,30 @@ def main():
                         sys.exit(1)
 
             dedup = Phase2TakeSelector(config)
-            shots, report = dedup.run(shots, script_beats)
+            shots, report = dedup.run(shots, script_beats, beat_analysis)
+
+            # 把剧本节奏分析结果注入每个镜头的 script_anchor，供 Phase 3 使用
+            if script_beats:
+                beat_info = {
+                    b.beat_id: {
+                        "estimated_duration": b.estimated_duration,
+                        "pace": b.pace,
+                        "emotion_intensity": b.emotion_intensity,
+                        "priority": b.priority,
+                        "required_shots_count": b.required_shots_count,
+                    }
+                    for b in script_beats
+                }
+                for shot in shots:
+                    if not shot.script_anchor:
+                        continue
+                    beat_id = shot.script_anchor.get("beat", "UNMATCHED")
+                    if beat_id in beat_info:
+                        shot.script_anchor.update(beat_info[beat_id])
+                # 更新 phase2_selected_shots.json
+                selected_shots_path = os.path.join(output_dir, 'phase2_selected_shots.json')
+                if os.path.exists(selected_shots_path):
+                    save_json({"shots": [s.to_dict() for s in shots]}, selected_shots_path)
 
         elif phase == 3:
             if shots is None:
@@ -304,7 +369,7 @@ def main():
             if audio_cfg.get("enabled", True):
                 try:
                     dubbing = Phase4Dubbing(config)
-                    dubbing.run(shots, decisions)
+                    dubbing.run(shots, decisions, script_beats=script_beats)
                 except Exception as e:
                     logger.error(f"Phase 4 配音配乐失败: {e}")
                     logger.warning("已跳过配音配乐，基础导出文件仍然可用。")

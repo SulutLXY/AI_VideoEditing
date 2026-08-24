@@ -337,6 +337,7 @@ def preprocess_script(
     """
     from src.services.script_service import ScriptPreprocessor, is_structured_outline, read_script_file, ScriptReadError, ScriptParseError
     from src.services.llm_service import LLMService
+    from src.utils import parse_script_outline
 
     # 确保工作区存在，用于保存 script.md
     work_dir = str(WORKSPACE_DIR)
@@ -388,6 +389,17 @@ def preprocess_script(
         preprocessor_config = config.get("script_preprocessing", {})
         preprocessor = ScriptPreprocessor(llm_service, preprocessor_config)
         parsed = preprocessor.preprocess(text_to_parse)
+
+        # 二次校验：确保解析结果真的能被提取出情节点
+        beats = parse_script_outline(parsed)
+        if not beats:
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(text_to_parse)
+            return (
+                text_to_parse,
+                f"剧本解析失败（来源：{source_label}）：模型返回了结构化文本，但未能提取出任何情节点。"
+                "请检查模型输出或手动编辑成标准大纲后再试。",
+            )
 
         with open(script_path, "w", encoding="utf-8") as f:
             f.write(parsed)
