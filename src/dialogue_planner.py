@@ -140,16 +140,35 @@ class DialoguePlanner:
             beat.content, character_states
         )
 
-        for line in beat.key_dialogue.splitlines():
-            line = line.strip()
-            if not line:
-                continue
+        # 关键台词可能是纯引号文本（无说话人前缀），先尝试拆出所有引号内对白
+        raw_text = beat.key_dialogue.strip()
+        quoted_segments = self._extract_quoted_segments(raw_text)
 
-            parsed = self._parse_dialogue_line(line)
-            if not parsed:
-                continue
+        if quoted_segments:
+            dialogue_items = []
+            for segment in quoted_segments:
+                parsed = self._parse_dialogue_line(segment)
+                if parsed:
+                    dialogue_items.append(parsed)
+                else:
+                    # 只有纯文本，没有说话人前缀，从 beat.content 推断
+                    speaker, stage_direction = self._infer_speaker_and_direction(beat.content)
+                    text = segment.strip('""').strip()
+                    dialogue_items.append((speaker, stage_direction, text))
+        else:
+            # 没有引号，按行尝试解析说话人前缀格式
+            dialogue_items = []
+            for line in raw_text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parsed = self._parse_dialogue_line(line)
+                if parsed:
+                    dialogue_items.append(parsed)
 
-            speaker, stage_direction, text = parsed
+        for speaker, stage_direction, text in dialogue_items:
+            if not text:
+                continue
 
             # 更新状态机：以当前 speaker 的最新状态为准
             character_states = self._update_state_from_direction(
@@ -212,6 +231,61 @@ class DialoguePlanner:
 
         # 完全无法解析，视作无对白
         return None
+
+    @staticmethod
+    def _extract_quoted_segments(text: str) -> List[str]:
+        """从关键台词字段中提取所有被引号包裹的对白片段"""
+        segments = []
+        # 匹配中文引号 ""xxx"" 或英文引号 "xxx"
+        for quote in ('"', '"', '"'):
+            if quote in text:
+                pattern = re.compile(rf"{re.escape(quote)}(.*?){re.escape(quote)}")
+                segments.extend(pattern.findall(text))
+        # 去重并保持顺序
+        seen = set()
+        result = []
+        for s in segments:
+            s = s.strip()
+            if s and s not in seen:
+                seen.add(s)
+                result.append(s)
+        return result
+
+    @staticmethod
+    def _infer_speaker_and_direction(content: str) -> Tuple[str, str]:
+        """根据 beat.content 推断说话人和舞台提示"""
+        if not content:
+            return "云琛", ""
+
+        content = str(content)
+
+        # 小六相关：如果内容只讲小六说话且没提到云琛说话
+        xiaoliu_speaking = any(k in content for k in ["小六", "小六的"])
+        yunchen_speaking = "云琛" in content
+
+        if xiaoliu_speaking and not yunchen_speaking:
+            speaker = "小六"
+        else:
+            # 默认主角云琛
+            speaker = "云琛"
+
+        # 推断舞台提示
+        directions = []
+        if "画外音" in content or "画外" in content:
+            directions.append("画外音")
+        if "压低嗓音" in content or "男人腔" in content:
+            directions.append("压低嗓音，用男人腔")
+        elif "低声" in content or "小声" in content or "自言自语" in content:
+            directions.append("低声")
+        elif "边跑边喊" in content:
+            directions.append("边跑边喊")
+        elif "喊" in content:
+            directions.append("喊")
+        elif "吐槽" in content:
+            directions.append("吐槽")
+
+        stage_direction = "，".join(directions)
+        return speaker, stage_direction
 
     # ------------------------------------------------------------------
     # 角色状态机
