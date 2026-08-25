@@ -135,11 +135,6 @@ class DialoguePlanner:
         if not beat.key_dialogue:
             return entries, character_states
 
-        # 先根据 beat.content 更新角色状态（如云琛换装）
-        character_states = self._update_states_from_content(
-            beat.content, character_states
-        )
-
         # 关键台词可能是纯引号文本（无说话人前缀），先尝试拆出所有引号内对白
         raw_text = beat.key_dialogue.strip()
         quoted_segments = self._extract_quoted_segments(raw_text)
@@ -198,6 +193,12 @@ class DialoguePlanner:
                 target_voice_role=target_voice_role,
             )
             entries.append(entry)
+
+        # beat.content 里描述的状态变化（如云琛换装）应影响下一 beat 的对白，
+        # 而不是当前 beat 已经说出的对白。
+        character_states = self._update_states_from_content(
+            beat.content, character_states
+        )
 
         return entries, character_states
 
