@@ -27,17 +27,18 @@ from src.utils import logger, ensure_dir
 # Qwen3-8B GGUF 发布源（按顺序尝试）
 # 国内用户优先走 hf-mirror 或 modelscope
 REPOS = [
-    {"name": "hf-mirror", "repo": "unsloth/Qwen3-8B-GGUF", "url_template": "https://hf-mirror.com/{repo}/resolve/main/{filename}"},
+    {"name": "hf-mirror-lmstudio", "repo": "lmstudio-community/Qwen3-8B-GGUF", "url_template": "https://hf-mirror.com/{repo}/resolve/main/{filename}"},
+    {"name": "hf-mirror-qwen", "repo": "Qwen/Qwen3-8B-GGUF", "url_template": "https://hf-mirror.com/{repo}/resolve/main/{filename}"},
     {"name": "modelscope", "repo": "qwen/Qwen3-8B-GGUF", "url_template": "https://modelscope.cn/models/{repo}/resolve/master/{filename}"},
-    {"name": "huggingface-unsloth", "repo": "unsloth/Qwen3-8B-GGUF", "url_template": "https://huggingface.co/{repo}/resolve/main/{filename}"},
+    {"name": "huggingface-lmstudio", "repo": "lmstudio-community/Qwen3-8B-GGUF", "url_template": "https://huggingface.co/{repo}/resolve/main/{filename}"},
     {"name": "huggingface-qwen", "repo": "Qwen/Qwen3-8B-GGUF", "url_template": "https://huggingface.co/{repo}/resolve/main/{filename}"},
 ]
 
 QUANT_FILE_MAP = {
-    "Q4_K_M": "qwen3-8b-q4_k_m.gguf",
-    "Q5_K_M": "qwen3-8b-q5_k_m.gguf",
-    "Q6_K": "qwen3-8b-q6_k.gguf",
-    "Q8_0": "qwen3-8b-q8_0.gguf",
+    "Q4_K_M": "Qwen3-8B-Q4_K_M.gguf",
+    "Q5_K_M": "Qwen3-8B-Q5_K_M.gguf",
+    "Q6_K": "Qwen3-8B-Q6_K.gguf",
+    "Q8_0": "Qwen3-8B-Q8_0.gguf",
 }
 
 # 各量化级别约占用显存（加载 KV cache 前，含少量余量）
