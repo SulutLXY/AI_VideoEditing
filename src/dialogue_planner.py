@@ -303,9 +303,18 @@ class DialoguePlanner:
         content = str(content)
 
         # 云琛状态切换关键词
-        if any(k in content for k in ["男装褪去", "露出女装", "女装", "仙女", "变回女装"]):
+        # 先判断明确的换装/变声过渡：女装/男装过渡关键字不要互相覆盖
+        female_transition = ["露出女装", "变回女装", "变作女装", "换上女装", "换成女装"]
+        male_transition = ["穿上男装", "恢复男装", "换上男装", "换成男装"]
+
+        if any(k in content for k in female_transition):
             character_states["云琛"] = "女装"
-        if any(k in content for k in ["穿上男装", "恢复男装", "男装", "压低嗓音", "男人腔"]):
+        elif any(k in content for k in male_transition):
+            character_states["云琛"] = "男装"
+        # 其次根据整体描述（无明确过渡时）：仙女/少女/娇声→女装；压低嗓音/男人腔/男声→男装
+        elif any(k in content for k in ["仙女", "少女", "娇声", "柔声"]):
+            character_states["云琛"] = "女装"
+        elif any(k in content for k in ["压低嗓音", "男人腔", "男声", "粗声"]):
             character_states["云琛"] = "男装"
 
         return character_states
