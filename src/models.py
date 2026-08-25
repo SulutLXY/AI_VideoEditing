@@ -82,6 +82,39 @@ class Relationships:
 
 
 @dataclass
+class DialogueEntry:
+    """剧本 beat 内的单条对白条目，用于驱动配音和时长规划"""
+    speaker: str = ""                       # 说话人，如 "云琛"
+    text: str = ""                          # 对白原文
+    gender_state: str = ""                  # 当前性别/状态，如 "男装" / "女装"
+    start_in_beat: float = 0.0              # 在该 beat 内的起始时间（秒）
+    estimated_duration: float = 0.0         # 以 1.0x 语速估算的时长（秒）
+    pace: str = "正常"                       # 节奏标签：爆发/快/正常/慢/静止
+    emotion: str = ""                       # 情绪标签
+    is_offscreen: bool = False              # 是否画外音
+    target_voice_role: str = ""             # 映射后的音色角色，如 "云琛-女装"
+
+    def to_dict(self):
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(data: Dict[str, Any]) -> "DialogueEntry":
+        if not data:
+            return DialogueEntry()
+        return DialogueEntry(
+            speaker=data.get("speaker", ""),
+            text=data.get("text", ""),
+            gender_state=data.get("gender_state", ""),
+            start_in_beat=float(data.get("start_in_beat", 0.0) or 0.0),
+            estimated_duration=float(data.get("estimated_duration", 0.0) or 0.0),
+            pace=data.get("pace", "正常"),
+            emotion=data.get("emotion", ""),
+            is_offscreen=bool(data.get("is_offscreen", False)),
+            target_voice_role=data.get("target_voice_role", ""),
+        )
+
+
+@dataclass
 class ScriptBeat:
     """剧本情节点"""
     act: str
@@ -99,9 +132,13 @@ class ScriptBeat:
     emotion_intensity: float = 0.0           # 情绪强度 0-5
     priority: int = 3                        # 剧情重要性 1-5，5 最高
     required_shots_count: int = 1            # 建议最少镜头数
+    # 由 dialogue_planner 生成，驱动后续配音
+    dialogue_entries: List[DialogueEntry] = field(default_factory=list)
 
     def to_dict(self):
-        return asdict(self)
+        data = asdict(self)
+        data["dialogue_entries"] = [e.to_dict() for e in self.dialogue_entries]
+        return data
 
     @property
     def numeric_weight(self) -> float:

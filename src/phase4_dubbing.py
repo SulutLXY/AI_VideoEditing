@@ -8,7 +8,7 @@ Phase 4 扩展：配音配乐合成
 
 输入：
 - config: 全局配置（需包含 audio/dubber/tts/music 段）
-- shots: Phase 1 输出的 Shot 列表
+- shots: Phase 1/2 输出的 Shot 列表
 - decisions: Phase 3 输出的 EditDecision 列表
 
 输出：
@@ -17,12 +17,12 @@ Phase 4 扩展：配音配乐合成
 - dub_info.json
 """
 import os
-from typing import List, Dict, Any, Optional, Set, Tuple
+import json
+from typing import List, Dict, Any, Optional
 from pathlib import Path
-from collections import defaultdict
 
-from src.models import Shot, ScriptBeat
-from src.utils import logger, ensure_dir, tc_to_sec, sec_to_tc
+from src.models import Shot, ScriptBeat, DialogueEntry
+from src.utils import logger, ensure_dir, tc_to_sec, sec_to_tc, load_json
 from src.audio import VoiceManager, VoiceEngine, MusicEngine, Dubber
 
 
@@ -34,6 +34,7 @@ class Phase4Dubbing:
         self.output_dir = config.get("paths", {}).get("output", "./output")
         self.audio_cfg = config.get("audio", {})
         self.dubber_cfg = config.get("dubber", {})
+        self.max_speed = float(self.audio_cfg.get("max_dialogue_speed", 2.0))
         ensure_dir(self.output_dir)
 
     def run(
@@ -42,13 +43,7 @@ class Phase4Dubbing:
         decisions: List[Any],
         script_beats: Optional[List[ScriptBeat]] = None,
     ) -> Dict[str, Any]:
-        """执行配音配乐合成
-
-        参数:
-            shots: Phase 1/2 输出的镜头列表
-            decisions: Phase 3 剪辑决策
-            script_beats: 剧本情节点列表，用于生成剧本驱动的配音文本
-        """
+        """执行配音配乐合成"""
         logger.info("=" * 60)
         logger.info("Phase 4: 配音配乐合成")
         logger.info("=" * 60)
@@ -59,13 +54,22 @@ class Phase4Dubbing:
 
         # 建立 shot_id -> Shot 映射
         shot_map = {s.shot_id: s for s in shots}
-        beat_map = {b.beat_id: b for b in (script_beats or [])}
 
-        # 构建 dubber 需要的时间线
+        # 加载剧本情节点（含 dialogue_entries）
+        script_beats = script_beats or self._load_script_beats()
+        beat_map = {b.beat_id: b for b in script_beats}
+        voice_cast = self._load_voice_cast()
+
+        # 构建视频时间线（只含视频信息，不再按镜头分配整段 key_dialogue）
         timeline = self._build_timeline(decisions, shot_map, beat_map)
         if not timeline:
             logger.warning("Phase 4: 没有可配音的有效段落，跳过")
             return {}
+
+        # 基于 dialogue_entries 构建精确对白时间轴
+        dialogue_segments = self._build_dialogue_segments(timeline, beat_map, voice_cast)
+        if not dialogue_segments:
+            logger.warning("Phase 4: 未生成任何对白段落，将只输出 BGM/视频")
 
         # 初始化音频引擎
         voice_manager = VoiceManager(self.config)
@@ -95,6 +99,7 @@ class Phase4Dubbing:
             bgm_mode=bgm_mode,
             default_voice_id=default_voice_id,
             keep_original_audio=keep_original,
+            dialogue_segments=dialogue_segments,
         )
 
         logger.info("Phase 4 完成")
@@ -105,17 +110,65 @@ class Phase4Dubbing:
 
         return result
 
+    # ------------------------------------------------------------------
+    # 数据加载
+    # ------------------------------------------------------------------
+    def _load_script_beats(self) -> List[ScriptBeat]:
+        """从 script_beats_analysis.json 加载剧本情节点"""
+        path = os.path.join(self.output_dir, "script_beats_analysis.json")
+        if not os.path.exists(path):
+            logger.warning(f"未找到剧本分析文件: {path}")
+            return []
+        try:
+            data = load_json(path)
+            beats = []
+            for b in data.get("beats", []):
+                beat = ScriptBeat(
+                    act=b.get("act", ""),
+                    scene=b.get("scene", ""),
+                    beat_id=b.get("beat_id", ""),
+                    location=b.get("location", ""),
+                    time=b.get("time", ""),
+                    content=b.get("content", ""),
+                    emotion=b.get("emotion", ""),
+                    key_actions=b.get("key_actions", []),
+                    key_dialogue=b.get("key_dialogue", ""),
+                    estimated_duration=float(b.get("estimated_duration", 0.0) or 0.0),
+                    pace=b.get("pace", "正常"),
+                    emotion_intensity=float(b.get("emotion_intensity", 0.0) or 0.0),
+                    priority=int(b.get("priority", 3) or 3),
+                    required_shots_count=int(b.get("required_shots_count", 1) or 1),
+                )
+                beat.dialogue_entries = [
+                    DialogueEntry.from_dict(e) for e in b.get("dialogue_entries", [])
+                ]
+                beats.append(beat)
+            return beats
+        except Exception as e:
+            logger.error(f"加载剧本情节点失败: {e}")
+            return []
+
+    def _load_voice_cast(self) -> Dict[str, Any]:
+        """加载 voice_cast 映射，优先 dialogue_plan.json，其次 config"""
+        path = os.path.join(self.output_dir, "dialogue_plan.json")
+        if os.path.exists(path):
+            try:
+                data = load_json(path)
+                return data.get("voice_cast", {})
+            except Exception as e:
+                logger.warning(f"加载 dialogue_plan.json 失败: {e}")
+        return self.audio_cfg.get("voice_cast", {})
+
+    # ------------------------------------------------------------------
+    # 视频时间线构建
+    # ------------------------------------------------------------------
     def _build_timeline(
         self,
         decisions: List[Any],
         shot_map: Dict[str, Shot],
         beat_map: Dict[str, ScriptBeat],
     ) -> List[Dict[str, Any]]:
-        """把 Phase 3 决策 + Shot 信息转成 dubber 时间线
-
-        配音文本按 beat 分配，每个 beat 的台词只出现一次，避免同一 beat 内多镜头重复配音。
-        """
-        # 统一 decisions 为 dict
+        """把 Phase 3 决策转成纯视频时间线（不含对白分配）"""
         decision_dicts = []
         for d in decisions:
             if hasattr(d, "to_dict"):
@@ -125,16 +178,7 @@ class Phase4Dubbing:
             else:
                 decision_dicts.append(d.__dict__)
 
-        logger.info(f"[Phase4] 构建配音时间线，共 {len(decision_dicts)} 个决策")
-
-        # 按 beat 分组，并预分配每句台词给最合适的镜头
-        beat_dialogue_assignments = self._assign_dialogues_to_beats(
-            decision_dicts, shot_map, beat_map
-        )
-        logger.info(f"[Phase4] 对话分配结果: {sum(1 for v in beat_dialogue_assignments.values() if v)} 个 primary 镜头")
-        for (bid, sid), is_primary in beat_dialogue_assignments.items():
-            if is_primary:
-                logger.info(f"[Phase4]   primary dialogue -> beat={bid}, shot={sid}")
+        logger.info(f"[Phase4] 构建视频时间线，共 {len(decision_dicts)} 个决策")
 
         timeline = []
         current_time = 0.0
@@ -143,32 +187,12 @@ class Phase4Dubbing:
             shot_id = d.get("shot_id", "")
             shot = shot_map.get(shot_id)
 
-            # 获取对应 beat
             beat_id = ""
-            beat = None
             if shot and shot.script_anchor:
                 beat_id = shot.script_anchor.get("beat", "")
-                beat = beat_map.get(beat_id)
             elif d.get("beat_id"):
                 beat_id = d.get("beat_id")
-                beat = beat_map.get(beat_id)
 
-            # 生成配音文本：只有被指定为对话镜头的才生成
-            is_primary = beat_dialogue_assignments.get((beat_id, shot_id), False)
-            dialogue, text_source = self._generate_dialogue_for_decision(shot, beat, is_primary)
-            logger.info(
-                f"[Phase4] timeline item shot={shot_id}, beat={beat_id}, "
-                f"primary={is_primary}, source={text_source}, dialogue={dialogue[:30]!r}"
-            )
-
-            # 提取台词和情绪
-            emotion = ""
-            speaker = ""
-            if shot:
-                emotion = shot.emotion or (beat.emotion if beat else "")
-                speaker = ", ".join(shot.characters) if shot.characters else ""
-
-            # 优先使用 Phase1 切分好的独立片段；否则回退到原始素材
             clip_path = d.get("clip_path") or d.get("source_clip") or d.get("video_path") or ""
             if not clip_path and shot:
                 split_path = None
@@ -176,12 +200,9 @@ class Phase4Dubbing:
                     split_path = shot.cv_metadata.get("shot_config", {}).get("split_clip_path")
                 clip_path = split_path or shot.source_path
                 if split_path and not os.path.exists(split_path):
-                    logger.warning(
-                        f"[Phase4] 切分片段不存在，回退到原始素材: {shot.shot_id}"
-                    )
+                    logger.warning(f"[Phase4] 切分片段不存在，回退到原始素材: {shot.shot_id}")
                     clip_path = shot.source_path
 
-            # 计算实际入点/出点/速度，并按速度折算成片时长
             fps = getattr(shot, "fps", 24.0) if shot else 24.0
             tc_in = d.get("tc_in") or (shot.tc_in if shot else "00:00:00:00")
             tc_out = d.get("tc_out") or (shot.tc_out if shot else sec_to_tc(getattr(shot, "duration_sec", 0.0), fps))
@@ -198,7 +219,6 @@ class Phase4Dubbing:
                 src_duration = max(0.0, src_out_sec - src_in_sec)
 
             duration_sec = src_duration / speed_mult if speed_mult > 0 else src_duration
-
             start_time = current_time
             end_time = current_time + duration_sec
             current_time = end_time
@@ -217,11 +237,7 @@ class Phase4Dubbing:
                 "end_time": end_time,
                 "duration_sec": duration_sec,
                 "src_duration": src_duration,
-                "dialogue": dialogue,
-                "dialogue_source": text_source,
-                "narration": d.get("narration", ""),
-                "emotion": emotion,
-                "speaker": speaker,
+                "beat_id": beat_id,
                 "speed": speed_str,
                 "speed_mult": speed_mult,
             }
@@ -229,154 +245,151 @@ class Phase4Dubbing:
 
         return timeline
 
-    def _assign_dialogues_to_beats(
+    # ------------------------------------------------------------------
+    # 对白时间轴构建
+    # ------------------------------------------------------------------
+    def _build_dialogue_segments(
         self,
-        decision_dicts: List[Dict],
-        shot_map: Dict[str, Shot],
+        timeline: List[Dict[str, Any]],
         beat_map: Dict[str, ScriptBeat],
-    ) -> Dict[Tuple[str, str], bool]:
-        """预分配每个 beat 的 key_dialogue 给最合适的镜头，返回 {(beat_id, shot_id): is_primary}
+        voice_cast: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """
+        将每个 beat 的 dialogue_entries 映射到绝对时间轴，并计算所需语速。
 
         策略：
-        - 若 beat 没有 key_dialogue，所有镜头都不是对话镜头。
-        - 若 beat 只有 1 个镜头，该镜头承担全部台词。
-        - 若 beat 有多个镜头，优先选 function='对话镜头' 的镜头；
-          否则选 action/asr 与 beat.key_dialogue 重叠度最高的。
+        - beat 内对白总时长 D，视频时长 B。
+        - 若 D <= B：按 1x 顺序播放，剩余时间作为间隙。
+        - 若 D > B：需要加速，目标语速 s = clamp(D / B, 1.0, max_speed)。
+          若 D / B > max_speed，则音频会溢出到下一个 beat（允许）。
         """
-        from collections import defaultdict
+        # 计算每个 beat 在成片时间轴上的起止时间
+        beat_time_ranges: Dict[str, Dict[str, float]] = {}
+        for item in timeline:
+            bid = item.get("beat_id", "")
+            if not bid or bid == "UNMATCHED":
+                continue
+            if bid not in beat_time_ranges:
+                beat_time_ranges[bid] = {"start": item["start_time"], "end": item["end_time"]}
+            else:
+                beat_time_ranges[bid]["start"] = min(beat_time_ranges[bid]["start"], item["start_time"])
+                beat_time_ranges[bid]["end"] = max(beat_time_ranges[bid]["end"], item["end_time"])
 
-        assignments: Dict[tuple, bool] = {}
-        beat_groups: Dict[str, List[Dict]] = defaultdict(list)
-
-        for d in decision_dicts:
-            shot_id = d.get("shot_id", "")
-            shot = shot_map.get(shot_id)
-            beat_id = ""
-            if shot and shot.script_anchor:
-                beat_id = shot.script_anchor.get("beat", "")
-            elif d.get("beat_id"):
-                beat_id = d.get("beat_id")
-            if beat_id:
-                beat_groups[beat_id].append(d)
-
-        def _simple_tokens(text: str) -> Set[str]:
-            """简单中文分词：按标点切分 + 2-gram"""
-            if not text:
-                return set()
-            delimiters = set("，、。！？；：""''（）(),.!?;:\"'() ")
-            text = str(text).lower()
-            words: Set[str] = set()
-            current = ""
-            for ch in text:
-                if ch in delimiters:
-                    if len(current) >= 2:
-                        words.add(current)
-                    current = ""
-                else:
-                    current += ch
-            if len(current) >= 2:
-                words.add(current)
-            for i in range(len(text) - 1):
-                bg = text[i:i + 2]
-                if bg[0] not in delimiters and bg[1] not in delimiters:
-                    words.add(bg)
-            return words
-
-        for beat_id, group in beat_groups.items():
+        segments = []
+        for beat_id, time_range in sorted(beat_time_ranges.items(), key=lambda x: x[1]["start"]):
             beat = beat_map.get(beat_id)
-            if not beat or not (beat.key_dialogue or beat.content):
+            if not beat:
+                continue
+            entries = getattr(beat, "dialogue_entries", []) or []
+            if not entries:
                 continue
 
-            if len(group) == 1:
-                assignments[(beat_id, group[0].get("shot_id"))] = True
+            beat_start = time_range["start"]
+            beat_end = time_range["end"]
+            beat_duration = beat_end - beat_start
+            if beat_duration <= 0:
                 continue
 
-            # 优先选 function='对话镜头'
-            dialogue_shots = []
-            for d in group:
-                shot = shot_map.get(d.get("shot_id"))
-                if shot and shot.script_anchor:
-                    if shot.script_anchor.get("function") == "对话镜头":
-                        dialogue_shots.append(d)
-
-            if len(dialogue_shots) == 1:
-                assignments[(beat_id, dialogue_shots[0].get("shot_id"))] = True
+            total_dialogue_1x = sum(e.estimated_duration for e in entries)
+            if total_dialogue_1x <= 0:
                 continue
-            if len(dialogue_shots) > 1:
-                group = dialogue_shots
 
-            # 按与 key_dialogue 的 token 重叠度排序
-            beat_text = beat.key_dialogue or beat.content or ""
-            beat_tokens = _simple_tokens(beat_text)
+            # 计算 beat 内统一目标语速
+            required_speed = total_dialogue_1x / beat_duration
+            if required_speed <= 1.0:
+                target_speed = 1.0
+            elif required_speed <= self.max_speed:
+                target_speed = required_speed
+            else:
+                target_speed = self.max_speed
 
-            def _dialogue_fit(d: Dict) -> float:
-                shot = shot_map.get(d.get("shot_id"))
-                if not shot or not beat_tokens:
-                    return 0.0
-                shot_text = " ".join(filter(None, [
-                    shot.action or "",
-                    getattr(shot, "action_details", "") or "",
-                    shot.asr_text or "",
-                    shot.dialogue or "",
-                ]))
-                shot_tokens = _simple_tokens(shot_text)
-                if not shot_tokens:
-                    return 0.0
-                overlap = shot_tokens & beat_tokens
-                recall = len(overlap) / len(beat_tokens)
-                precision = len(overlap) / len(shot_tokens)
-                if recall + precision <= 0:
-                    return 0.0
-                return 2 * recall * precision / (recall + precision)
+            overflow = required_speed > self.max_speed
+            if overflow:
+                logger.info(
+                    f"[Phase4] beat {beat_id} 对白 {total_dialogue_1x:.1f}s 超出视频 "
+                    f"{beat_duration:.1f}s，将以 {self.max_speed}x 语速溢出"
+                )
 
-            group_sorted = sorted(group, key=_dialogue_fit, reverse=True)
-            assignments[(beat_id, group_sorted[0].get("shot_id"))] = True
+            # Edge TTS rate 字符串
+            if abs(target_speed - 1.0) < 0.05:
+                rate_str = "+0%"
+            else:
+                rate_pct = int(round((target_speed - 1.0) * 100))
+                rate_str = f"+{rate_pct}%"
 
-        return assignments
+            cursor = beat_start
+            for idx, entry in enumerate(entries):
+                if not entry.text:
+                    continue
 
-    def _generate_dialogue_for_decision(
-        self,
-        shot: Optional[Shot],
-        beat: Optional[ScriptBeat],
-        is_primary_dialogue: bool,
-    ) -> tuple:
-        """为当前决策生成配音文本，避免重复原视频 ASR 对白。
+                # 本条对白的起始时间
+                entry_start = cursor
+                actual_audio_duration = entry.estimated_duration / target_speed if target_speed > 0 else entry.estimated_duration
 
-        只有被指定为 primary 的对话镜头才生成 key_dialogue，其余镜头不生成对白。
-        """
-        if not beat:
-            # 没有对应 beat 的镜头：不生成对白（避免 ASR 噪音）
-            return "", "无对白"
+                voice_id = self._resolve_voice_id(entry.target_voice_role, voice_cast)
 
-        # 只有主对话镜头生成 key_dialogue
-        if is_primary_dialogue:
-            if beat.key_dialogue and beat.key_dialogue.strip():
-                return beat.key_dialogue.strip(), "剧本对白"
-            if beat.content and beat.content.strip():
-                return self._summarize_to_line(beat.content, max_chars=40), "剧本旁白"
+                seg = {
+                    "id": f"{beat_id}_d{idx:02d}",
+                    "text": entry.text,
+                    "speaker": entry.speaker,
+                    "emotion": entry.emotion or beat.emotion,
+                    "start": round(entry_start, 3),
+                    "end": round(entry_start + actual_audio_duration, 3),
+                    "beat_id": beat_id,
+                    "beat_start": beat_start,
+                    "beat_end": beat_end,
+                    "voice_id": voice_id,
+                    "rate": rate_str,
+                    "target_speed": round(target_speed, 2),
+                    "estimated_duration_1x": entry.estimated_duration,
+                    "overflow": overflow,
+                }
+                segments.append(seg)
 
-        # 非主镜头：不生成对白
-        return "", "无对白"
+                cursor = entry_start + actual_audio_duration
 
-    @staticmethod
-    def _summarize_to_line(content: str, max_chars: int = 40) -> str:
-        """把 beat.content 提炼成一句适合配音的短句"""
-        if not content:
+        logger.info(f"[Phase4] 生成 {len(segments)} 条对白段落")
+        for seg in segments:
+            overflow_note = " [溢出]" if seg.get("overflow") else ""
+            logger.info(
+                f"[Phase4]   {seg['id']}: t={seg['start']:.2f}s~{seg['end']:.2f}s, "
+                f"speed={seg['target_speed']:.2f}x, voice={seg['voice_id']}, "
+                f"text={seg['text'][:24]!r}{overflow_note}"
+            )
+
+        return segments
+
+    def _resolve_voice_id(self, target_voice_role: str, voice_cast: Dict[str, Any]) -> str:
+        """把 target_voice_role 解析成 Edge TTS voice_id"""
+        if not target_voice_role:
             return ""
-        # 去掉特殊符号和多余空格
-        text = content.replace("△", "").replace("□", "").replace("\n", " ").strip()
-        # 截取前 max_chars 字符，尽量在句末结束
-        if len(text) <= max_chars:
-            return text
-        # 在 max_chars 前找最后一个标点
-        cut = max_chars
-        for i in range(max_chars - 1, max_chars // 2, -1):
-            if text[i] in "，。！？；,!?;":
-                cut = i + 1
-                break
-        return text[:cut].strip()
 
+        # 1) 先查 voice_cast
+        cfg = voice_cast.get(target_voice_role)
+        if isinstance(cfg, dict):
+            raw = cfg.get("voice_id", "")
+        elif isinstance(cfg, str):
+            raw = cfg
+        else:
+            raw = ""
 
+        # 2) 角色默认兜底
+        if not raw:
+            defaults = {
+                "云琛-男装": "zh-CN-YunxiNeural",
+                "云琛-女装": "zh-CN-XiaoxiaoNeural",
+                "小六": "zh-CN-YunjianNeural",
+            }
+            raw = defaults.get(target_voice_role, "")
+
+        # 3) 补全 edge_ 前缀
+        if raw and not raw.startswith("edge_"):
+            raw = f"edge_{raw}"
+        return raw
+
+    # ------------------------------------------------------------------
+    # 工具
+    # ------------------------------------------------------------------
     @staticmethod
     def _parse_speed(speed_str: str) -> float:
         """解析速度字符串为倍率：2x/200% -> 2.0，50% -> 0.5"""
@@ -399,12 +412,3 @@ class Phase4Dubbing:
             return float(s)
         except Exception:
             return 1.0
-
-    @staticmethod
-    def _estimate_duration(tc_in: str, tc_out: str) -> float:
-        """粗略从时间码估算时长"""
-        try:
-            from src.utils import tc_to_sec
-            return tc_to_sec(tc_out) - tc_to_sec(tc_in)
-        except Exception:
-            return 0.0

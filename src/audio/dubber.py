@@ -283,6 +283,7 @@ class Dubber:
         bgm_mode: str = "match",
         default_voice_id: Optional[str] = None,
         keep_original_audio: bool = False,
+        dialogue_segments: Optional[List[Dict]] = None,
     ) -> Dict:
         """
         从 Phase 3 剪辑决策时间线生成配音成片
@@ -296,6 +297,8 @@ class Dubber:
             bgm_mode: "match" 本地库匹配 / "generate" AI生成 / "none" 无BGM
             default_voice_id: 默认音色 ID，未提供时使用首个 edge_tts 音色
             keep_original_audio: 是否保留原视频音频并降低音量混合
+            dialogue_segments: 可选：预先生成的对白时间轴，覆盖从 timeline 提取的对白。
+                              每条需含 text / start / end / voice_id / rate 等字段。
 
         Returns:
             {"video": ..., "audio": ..., "voice_files": [...], "bgm": ..., "meta": ...}
@@ -328,25 +331,38 @@ class Dubber:
             return None
 
         def _choose_voice(segment: dict) -> Optional[VoiceProfile]:
-            """为单段文本选择音色：优先按情绪映射，否则 fallback 到 default_voice_id"""
-            # 1) 按情绪选音色
+            """为单段文本选择音色：优先使用 segment 指定的 voice_id，再按情绪/speaker/fallback"""
+            # 1) 如果 segment 已指定 voice_id，优先使用
+            voice_id = segment.get("voice_id")
+            if voice_id:
+                # 兼容无 edge_ 前缀的 voice_id
+                if not voice_id.startswith("edge_"):
+                    voice_id = f"edge_{voice_id}"
+                voice = voice_manager.get_voice(voice_id)
+                if voice:
+                    return voice
+
+            # 2) 按情绪选音色
             voice_id = _emotion_to_voice_id(segment.get("emotion", ""))
             if voice_id:
                 voice = voice_manager.get_voice(voice_id)
                 if voice:
                     return voice
-            # 2) 按 speaker 名字选（如果有 speaker 且配置中存在对应音色）
+
+            # 3) 按 speaker 名字选
             speaker = segment.get("speaker", "")
             if speaker:
                 voice = voice_manager.get_voice_by_name(speaker) or voice_manager.get_voice(f"edge_{speaker}")
                 if voice:
                     return voice
-            # 3) fallback 到 default_voice_id
+
+            # 4) fallback 到 default_voice_id
             if default_voice_id:
                 voice = voice_manager.get_voice(default_voice_id)
                 if voice:
                     return voice
-            # 4) 最终兜底：第一个可用 edge_tts 音色
+
+            # 5) 最终兜底：第一个可用 edge_tts 音色
             voices = voice_manager.list_voices(engine="edge_tts")
             return voices[0] if voices else None
 
@@ -361,19 +377,37 @@ class Dubber:
             text = re.sub(r"\s+", " ", text).strip()
             return text
 
-        segments = []
-        for i, item in enumerate(timeline):
-            text = item.get("dialogue") or item.get("narration") or ""
-            text = _clean_tts_text(text)
-            if text:
+        # 使用传入的对白时间轴，或从 timeline 中提取
+        if dialogue_segments:
+            segments = []
+            for i, seg in enumerate(dialogue_segments):
+                text = _clean_tts_text(seg.get("text", ""))
+                if not text:
+                    continue
                 segments.append({
-                    "id": f"seg_{i:03d}",
+                    "id": seg.get("id") or f"seg_{i:03d}",
                     "text": text,
-                    "emotion": item.get("emotion", ""),
-                    "speaker": item.get("speaker", ""),
-                    "start": item.get("start_time", 0.0),
-                    "end": item.get("end_time", 0.0),
+                    "emotion": seg.get("emotion", ""),
+                    "speaker": seg.get("speaker", ""),
+                    "start": seg.get("start", 0.0),
+                    "end": seg.get("end", 0.0),
+                    "voice_id": seg.get("voice_id"),
+                    "rate": seg.get("rate"),
                 })
+        else:
+            segments = []
+            for i, item in enumerate(timeline):
+                text = item.get("dialogue") or item.get("narration") or ""
+                text = _clean_tts_text(text)
+                if text:
+                    segments.append({
+                        "id": f"seg_{i:03d}",
+                        "text": text,
+                        "emotion": item.get("emotion", ""),
+                        "speaker": item.get("speaker", ""),
+                        "start": item.get("start_time", 0.0),
+                        "end": item.get("end_time", 0.0),
+                    })
 
         logger.info(f"[Dubber] 共 {len(segments)} 段文本待合成")
 
@@ -401,7 +435,8 @@ class Dubber:
             seg["voice_name"] = voice.name
             try:
                 logger.info(f"[Dubber] [{seg['id']}] 情绪'{seg.get('emotion', '')}' -> 音色'{voice.name}'({voice.id})")
-                voice_engine.synthesize(seg["text"], voice, output_file, duration=duration)
+                rate = seg.get("rate")
+                voice_engine.synthesize(seg["text"], voice, output_file, duration=duration, rate=rate)
             except Exception as e:
                 logger.error(f"[Dubber] 语音合成失败 [{seg['id']}]: {e}")
                 failed_segments.append({"id": seg["id"], "text": seg["text"], "error": str(e), "voice_id": voice.id, "voice_name": voice.name})

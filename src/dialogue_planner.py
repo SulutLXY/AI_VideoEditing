@@ -1,0 +1,330 @@
+"""
+DialoguePlanner: 剧本对白规划器
+
+职责：
+1. 解析 ScriptBeat.key_dialogue，提取说话人、状态提示、对白文本。
+2. 维护角色状态机（如云琛男装/女装切换）。
+3. 为每条对白估算 1x 语速时长，并计算最大语速下的最短时长。
+4. 输出 voice_cast.json 角色-音色映射，供 Phase 4 TTS 使用。
+5. 生成结构化 dialogue_plan.json，供 Phase 3/4 做音画同步约束。
+
+输入：ScriptBeat 列表
+输出：更新后的 ScriptBeat 列表（含 dialogue_entries）+ voice_cast 字典
+"""
+import re
+import os
+from typing import List, Dict, Any, Optional, Tuple
+
+from src.models import ScriptBeat, DialogueEntry
+from src.utils import logger, save_json
+
+
+class DialoguePlanner:
+    """对白规划器"""
+
+    # 默认语速：中文字/秒
+    PACE_CHARS_PER_SEC = {
+        "爆发": 5.5,
+        "快": 5.0,
+        "正常": 4.5,
+        "慢": 3.5,
+        "静止": 3.0,
+    }
+
+    # 默认角色音色映射（Edge TTS）
+    DEFAULT_VOICE_CAST = {
+        "云琛-男装": {
+            "role": "中性",
+            "voice_id": "zh-CN-YunxiNeural",
+            "description": "云琛男装状态，偏中性/男声",
+        },
+        "云琛-女装": {
+            "role": "少女",
+            "voice_id": "zh-CN-XiaoxiaoNeural",
+            "description": "云琛女装状态，少女声",
+        },
+        "小六": {
+            "role": "少年",
+            "voice_id": "zh-CN-YunjianNeural",
+            "description": "小六，少年声",
+        },
+        "default": {
+            "role": "默认",
+            "voice_id": "zh-CN-YunxiNeural",
+            "description": "未识别角色，使用默认音色",
+        },
+    }
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        audio_cfg = config.get("audio", {})
+        self.max_speed = float(audio_cfg.get("max_dialogue_speed", 2.0))
+        self.base_chars_per_sec = float(audio_cfg.get("base_chars_per_sec", 4.5))
+        self.voice_cast_override = audio_cfg.get("voice_cast", {}) or {}
+        self.output_dir = config.get("paths", {}).get("output", "./output")
+
+        # 合并用户覆盖的音色映射
+        self.voice_cast = self._build_voice_cast()
+
+    # ------------------------------------------------------------------
+    # 公共入口
+    # ------------------------------------------------------------------
+    def plan(self, beats: List[ScriptBeat]) -> Tuple[List[ScriptBeat], Dict[str, Any]]:
+        """为所有 beat 解析对白，生成 dialogue_entries 和 voice_cast"""
+        logger.info("=" * 60)
+        logger.info("DialoguePlanner: 解析剧本对白并规划配音")
+        logger.info("=" * 60)
+
+        # 维护角色状态机
+        character_states: Dict[str, str] = {}
+        total_entries = 0
+        total_dialogue_duration_1x = 0.0
+
+        for beat in beats:
+            entries, character_states = self._parse_beat_dialogue(
+                beat, character_states
+            )
+            beat.dialogue_entries = entries
+            total_entries += len(entries)
+            total_dialogue_duration_1x += sum(e.estimated_duration for e in entries)
+
+        report = {
+            "total_beats": len(beats),
+            "beats_with_dialogue": sum(1 for b in beats if b.dialogue_entries),
+            "total_entries": total_entries,
+            "total_dialogue_duration_1x": round(total_dialogue_duration_1x, 2),
+            "total_dialogue_duration_max_speed": round(
+                total_dialogue_duration_1x / self.max_speed, 2
+            ),
+            "max_speed": self.max_speed,
+            "base_chars_per_sec": self.base_chars_per_sec,
+            "voice_cast": self.voice_cast,
+            "beats": [
+                {
+                    "beat_id": b.beat_id,
+                    "entries": [e.to_dict() for e in b.dialogue_entries],
+                    "beat_dialogue_duration_1x": round(
+                        sum(e.estimated_duration for e in b.dialogue_entries), 2
+                    ),
+                    "beat_dialogue_duration_min": round(
+                        sum(e.estimated_duration for e in b.dialogue_entries) / self.max_speed, 2
+                    ),
+                }
+                for b in beats
+            ],
+        }
+
+        save_json(report, os.path.join(self.output_dir, "dialogue_plan.json"))
+        logger.info(
+            f"对白规划完成: {total_entries} 条对白, "
+            f"1x 总时长 {total_dialogue_duration_1x:.1f}s, "
+            f"最大语速 {self.max_speed}x 下最短 {total_dialogue_duration_1x / self.max_speed:.1f}s"
+        )
+        return beats, report
+
+    # ------------------------------------------------------------------
+    # 解析单条 beat 的对白
+    # ------------------------------------------------------------------
+    def _parse_beat_dialogue(
+        self,
+        beat: ScriptBeat,
+        character_states: Dict[str, str],
+    ) -> Tuple[List[DialogueEntry], Dict[str, str]]:
+        """解析一个 beat 的 key_dialogue，返回 dialogue_entries 和更新后的状态机"""
+        entries: List[DialogueEntry] = []
+        if not beat.key_dialogue:
+            return entries, character_states
+
+        # 先根据 beat.content 更新角色状态（如云琛换装）
+        character_states = self._update_states_from_content(
+            beat.content, character_states
+        )
+
+        for line in beat.key_dialogue.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+
+            parsed = self._parse_dialogue_line(line)
+            if not parsed:
+                continue
+
+            speaker, stage_direction, text = parsed
+
+            # 更新状态机：以当前 speaker 的最新状态为准
+            character_states = self._update_state_from_direction(
+                speaker, stage_direction, character_states
+            )
+
+            # 确定当前 speaker 的性别/状态
+            gender_state = self._resolve_gender_state(speaker, character_states)
+
+            # 目标音色角色
+            target_voice_role = self._resolve_voice_role(speaker, gender_state)
+
+            # 估算时长
+            pace = self._resolve_pace(beat.pace, stage_direction)
+            chars_per_sec = self.PACE_CHARS_PER_SEC.get(pace, self.base_chars_per_sec)
+            estimated_duration = len(text) / chars_per_sec if chars_per_sec > 0 else 0.0
+
+            entry = DialogueEntry(
+                speaker=speaker,
+                text=text,
+                gender_state=gender_state,
+                start_in_beat=0.0,  # Phase 3 再根据镜头排布写入具体时间
+                estimated_duration=round(estimated_duration, 2),
+                pace=pace,
+                emotion=self._resolve_emotion(beat.emotion, stage_direction),
+                is_offscreen="画外音" in stage_direction or "画外" in stage_direction,
+                target_voice_role=target_voice_role,
+            )
+            entries.append(entry)
+
+        return entries, character_states
+
+    @staticmethod
+    def _parse_dialogue_line(line: str) -> Optional[Tuple[str, str, str]]:
+        """
+        解析单行对白。
+        支持格式：
+        - 云琛（边跑边喊）：天天又叫又跑的？
+        - 小六（画外音）：霍帮招聘护卫了！
+        - 云琛（小声自言自语）：五年了...
+        - 云琛（画外音，故意压低嗓音，用低沉的男人腔）：接着——
+        - 小六: 什么？
+        """
+        # 尝试匹配「说话人（状态）：文本」
+        pattern = r"^(.+?)[（(](.+?)[）)][:：]\s*(.+)$"
+        m = re.match(pattern, line)
+        if m:
+            speaker = m.group(1).strip()
+            stage_direction = m.group(2).strip()
+            text = m.group(3).strip()
+            return speaker, stage_direction, text
+
+        # 没有状态括号，只匹配「说话人：文本」
+        pattern2 = r"^(.+?)[:：]\s*(.+)$"
+        m2 = re.match(pattern2, line)
+        if m2:
+            speaker = m2.group(1).strip()
+            text = m2.group(2).strip()
+            return speaker, "", text
+
+        # 完全无法解析，视作无对白
+        return None
+
+    # ------------------------------------------------------------------
+    # 角色状态机
+    # ------------------------------------------------------------------
+    def _update_states_from_content(
+        self,
+        content: str,
+        character_states: Dict[str, str],
+    ) -> Dict[str, str]:
+        """根据 beat.content 更新角色状态（如云琛换装）"""
+        if not content:
+            return character_states
+
+        content = str(content)
+
+        # 云琛状态切换关键词
+        if any(k in content for k in ["男装褪去", "露出女装", "女装", "仙女", "变回女装"]):
+            character_states["云琛"] = "女装"
+        if any(k in content for k in ["穿上男装", "恢复男装", "男装", "压低嗓音", "男人腔"]):
+            character_states["云琛"] = "男装"
+
+        return character_states
+
+    def _update_state_from_direction(
+        self,
+        speaker: str,
+        stage_direction: str,
+        character_states: Dict[str, str],
+    ) -> Dict[str, str]:
+        """根据括号内的舞台提示更新状态"""
+        if not stage_direction or speaker != "云琛":
+            return character_states
+
+        d = str(stage_direction)
+        female_cues = ["女装", "少女", "仙女", "柔声", "娇声"]
+        male_cues = ["男装", "男人腔", "低沉", "压低嗓音", "男声", "粗声"]
+
+        if any(c in d for c in female_cues):
+            character_states["云琛"] = "女装"
+        elif any(c in d for c in male_cues):
+            character_states["云琛"] = "男装"
+
+        return character_states
+
+    def _resolve_gender_state(
+        self, speaker: str, character_states: Dict[str, str]
+    ) -> str:
+        """确定 speaker 当前的性别/状态"""
+        if speaker == "云琛":
+            return character_states.get("云琛", "男装")
+        return ""
+
+    # ------------------------------------------------------------------
+    # 音色 / 语速 / 情绪解析
+    # ------------------------------------------------------------------
+    def _resolve_voice_role(self, speaker: str, gender_state: str) -> str:
+        """把 speaker + 状态映射到 voice_cast 中的角色键"""
+        if speaker == "云琛":
+            return f"云琛-{gender_state}"
+        return speaker
+
+    def _resolve_pace(self, beat_pace: str, stage_direction: str) -> str:
+        """结合 beat 节奏和舞台提示决定对白语速档位"""
+        d = str(stage_direction).lower()
+        if any(k in d for k in ["喊", "急", "快", "急促", "爆发"]):
+            return "快"
+        if any(k in d for k in ["慢", "低声", "小声", "自言自语", "缓缓"]):
+            return "慢"
+        if beat_pace in self.PACE_CHARS_PER_SEC:
+            return beat_pace
+        return "正常"
+
+    @staticmethod
+    def _resolve_emotion(beat_emotion: str, stage_direction: str) -> str:
+        """从舞台提示提取情绪，回退到 beat 情绪"""
+        d = str(stage_direction)
+        emotion_map = {
+            "焦虑": "焦虑",
+            "紧张": "紧张",
+            "愤怒": "愤怒",
+            "开心": "开心",
+            "悲伤": "悲伤",
+            "压低嗓音": "阴沉",
+            "低声": "低沉",
+            "喊": "激动",
+            "急": "焦急",
+        }
+        for cue, emotion in emotion_map.items():
+            if cue in d:
+                return emotion
+        return beat_emotion or ""
+
+    # ------------------------------------------------------------------
+    # voice_cast 构建
+    # ------------------------------------------------------------------
+    def _build_voice_cast(self) -> Dict[str, Any]:
+        """合并默认音色映射和用户覆盖配置"""
+        cast = dict(self.DEFAULT_VOICE_CAST)
+
+        # 用户覆盖：可以是 {speaker: voice_id} 或完整 dict
+        for key, value in self.voice_cast_override.items():
+            if key in cast and isinstance(value, str):
+                cast[key]["voice_id"] = value
+            elif isinstance(value, dict):
+                cast[key] = {**cast.get(key, {}), **value}
+            else:
+                cast[key] = {"role": key, "voice_id": value, "description": "用户自定义"}
+
+        return cast
+
+    def get_voice_id(self, target_voice_role: str) -> str:
+        """根据 target_voice_role 返回实际 TTS voice_id"""
+        role_cfg = self.voice_cast.get(target_voice_role) or self.voice_cast.get("default")
+        if isinstance(role_cfg, dict):
+            return role_cfg.get("voice_id", self.DEFAULT_VOICE_CAST["default"]["voice_id"])
+        return role_cfg or self.DEFAULT_VOICE_CAST["default"]["voice_id"]

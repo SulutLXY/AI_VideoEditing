@@ -84,13 +84,21 @@ class Phase3Editor:
     # 剧本节奏加载
     # ------------------------------------------------------------------
     def _load_script_beats(self) -> Dict[str, Dict]:
-        """加载 Phase 2 的剧本节奏分析结果"""
+        """加载 Phase 2 的剧本节奏分析结果（含 dialogue_entries）"""
         path = os.path.join(self.output_dir, 'script_beats_analysis.json')
         if not os.path.exists(path):
             return {}
         try:
             data = load_json(path)
-            return {b.get('beat_id'): b for b in data.get('beats', []) if b.get('beat_id')}
+            beat_map = {b.get('beat_id'): b for b in data.get('beats', []) if b.get('beat_id')}
+            for beat_id, b in beat_map.items():
+                entries = b.get('dialogue_entries', [])
+                if entries:
+                    logger.info(
+                        f"[Phase3] beat {beat_id} 加载 {len(entries)} 条对白, "
+                        f"1x 总时长 {sum(e.get('estimated_duration', 0) for e in entries):.1f}s"
+                    )
+            return beat_map
         except Exception as e:
             logger.warning(f"加载剧本节奏分析失败: {e}")
             return {}
@@ -544,8 +552,13 @@ class Phase3Editor:
         beat_decisions_map: Dict[str, List[EditDecision]],
         shot_map: Dict[str, Shot],
     ) -> Dict[str, float]:
-        """从 shot.script_anchor 中附加的 beat 分析信息构建每个 beat 的目标时长"""
+        """从 shot.script_anchor 中附加的 beat 分析信息构建每个 beat 的目标时长。
+
+        新增：若 beat 内有对白，目标时长至少应容纳 max_speed 语速下的对白。
+        """
         targets = {}
+        max_speed = self.config.get("audio", {}).get("max_dialogue_speed", 2.0)
+
         for beat_id, decisions in beat_decisions_map.items():
             for d in decisions:
                 shot = shot_map.get(d.shot_id)
@@ -555,6 +568,20 @@ class Phase3Editor:
                 if est is not None and float(est) > 0:
                     targets[beat_id] = float(est)
                     break
+
+            # 对白时长约束：beat 视频至少要能把对白播完（最大语速下）
+            beat_info = self.beat_map.get(beat_id, {})
+            entries = beat_info.get("dialogue_entries", [])
+            dialogue_dur_1x = sum(e.get("estimated_duration", 0.0) for e in entries)
+            if dialogue_dur_1x > 0 and max_speed > 0:
+                min_video_duration = dialogue_dur_1x / max_speed
+                current_target = targets.get(beat_id, 0.0)
+                if current_target < min_video_duration:
+                    logger.info(
+                        f"[Phase3] beat {beat_id} 目标时长 {current_target:.1f}s "
+                        f"小于对白最短 {min_video_duration:.1f}s，调整目标"
+                    )
+                    targets[beat_id] = min_video_duration
 
         # 剩余的 beat 平均分配剩余时长
         num_beats = len(beat_decisions_map)

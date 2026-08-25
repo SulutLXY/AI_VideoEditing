@@ -36,6 +36,7 @@ from src.phase0_rough_cut import RoughCutAnalyzer
 from src.phase1_analyzer import Phase1Analyzer
 from src.phase2_dedup import Phase2TakeSelector
 from src.phase2_inventory import MaterialInventoryBuilder
+from src.dialogue_planner import DialoguePlanner
 from src.phase3_editor import Phase3Editor, EditDecision
 from src.phase4_exporter import Phase4Exporter
 from src.phase4_dubbing import Phase4Dubbing
@@ -247,6 +248,13 @@ def main():
                                 beat.emotion_intensity = info.get("emotion_intensity", 0.0)
                                 beat.priority = info.get("priority", 3)
                                 beat.required_shots_count = info.get("required_shots_count", 1)
+                        # 解析对白，生成 voice_cast 和 dialogue_entries
+                        try:
+                            planner = DialoguePlanner(config)
+                            script_beats, _ = planner.plan(script_beats)
+                        except Exception as e:
+                            logger.warning(f"对白规划失败，将使用原始 key_dialogue: {e}")
+
                         save_json(
                             {"beats": [b.to_dict() for b in script_beats], "analysis": beat_analysis},
                             os.path.join(output_dir, 'script_beats_analysis.json')
