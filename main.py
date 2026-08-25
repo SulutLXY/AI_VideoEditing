@@ -235,6 +235,7 @@ def main():
                     logger.info(f"  - {beat.act} / {beat.beat_id}: {beat.content[:40]}...")
 
                 # 用 LLM 分析剧本节奏，为每个 beat 分配目标时长
+                beat_analysis = {}
                 try:
                     llm_service = LLMService(config)
                     target_duration = parse_duration_string(config['project'].get('target_duration', 0))
