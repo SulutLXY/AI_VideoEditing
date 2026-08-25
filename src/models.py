@@ -140,6 +140,32 @@ class ScriptBeat:
         data["dialogue_entries"] = [e.to_dict() for e in self.dialogue_entries]
         return data
 
+    @staticmethod
+    def from_dict(data: Dict[str, Any]) -> "ScriptBeat":
+        """从字典重建 ScriptBeat，兼容旧版无 analysis 字段"""
+        if not data:
+            data = {}
+        beat = ScriptBeat(
+            act=data.get("act", ""),
+            scene=data.get("scene", ""),
+            beat_id=data.get("beat_id", ""),
+            location=data.get("location", ""),
+            time=data.get("time", ""),
+            content=data.get("content", ""),
+            emotion=data.get("emotion", ""),
+            key_actions=data.get("key_actions") or [],
+            key_dialogue=data.get("key_dialogue", ""),
+            estimated_duration=float(data.get("estimated_duration", 0.0) or 0.0),
+            pace=data.get("pace", "正常"),
+            emotion_intensity=float(data.get("emotion_intensity", 0.0) or 0.0),
+            priority=int(data.get("priority", 3) or 3),
+            required_shots_count=int(data.get("required_shots_count", 1) or 1),
+        )
+        beat.dialogue_entries = [
+            DialogueEntry.from_dict(e) for e in (data.get("dialogue_entries") or [])
+        ]
+        return beat
+
     @property
     def numeric_weight(self) -> float:
         """综合权重：priority + emotion_intensity，用于全局时长分配校验"""

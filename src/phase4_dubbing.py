@@ -55,8 +55,10 @@ class Phase4Dubbing:
         # 建立 shot_id -> Shot 映射
         shot_map = {s.shot_id: s for s in shots}
 
-        # 加载剧本情节点（含 dialogue_entries）
-        script_beats = script_beats or self._load_script_beats()
+        # 加载剧本情节点（含 dialogue_entries）。
+        # 注意：文件中的分析结果（dialogue_entries）优先于 main.py 传入的 bare script_beats。
+        file_beats = self._load_script_beats()
+        script_beats = file_beats if file_beats else (script_beats or [])
         beat_map = {b.beat_id: b for b in script_beats}
         voice_cast = self._load_voice_cast()
 

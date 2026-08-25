@@ -32,6 +32,7 @@ from src.utils import (
     init_logging, Shot, get_video_files, save_json,
     parse_duration_string,
 )
+from src.models import ScriptBeat
 from src.phase0_rough_cut import RoughCutAnalyzer
 from src.phase1_analyzer import Phase1Analyzer
 from src.phase2_dedup import Phase2TakeSelector
@@ -167,16 +168,34 @@ def main():
 
     # 若后续阶段依赖剧本，提前统一加载，避免单独跑 Phase 3/4 时丢失剧本信息
     if any(p >= 2 for p in phases_to_run):
-        script_path = config['paths']['script_outline']
-        if os.path.exists(script_path) and script_beats is None:
-            logger.info(f"预加载剧本大纲: {script_path}")
-            script_beats = parse_script_outline(script_path)
-            if script_beats:
-                logger.info(f"剧本解析完成: {len(script_beats)} 个情节点")
-                for beat in script_beats:
-                    logger.info(f"  - {beat.act} / {beat.beat_id}: {beat.content[:40]}...")
-            else:
-                logger.warning("未能从剧本大纲解析出任何情节点，后续阶段可能无法生成剧本驱动配音")
+        # 优先使用已分析的剧本文件（含 dialogue_entries / 节奏分析），否则回退解析 script.md
+        analyzed_script_path = os.path.join(output_dir, 'script_beats_analysis.json')
+        if os.path.exists(analyzed_script_path) and script_beats is None:
+            logger.info(f"预加载已分析的剧本文件: {analyzed_script_path}")
+            try:
+                analyzed_data = load_json(analyzed_script_path)
+                script_beats = [ScriptBeat.from_dict(b) for b in analyzed_data.get("beats", [])]
+                if script_beats:
+                    logger.info(f"剧本分析数据加载完成: {len(script_beats)} 个情节点")
+                    for beat in script_beats:
+                        logger.info(f"  - {beat.act} / {beat.beat_id}: {beat.content[:40]}...")
+                else:
+                    logger.warning("剧本分析文件为空，回退解析 script.md")
+            except Exception as e:
+                logger.warning(f"加载剧本分析文件失败: {e}，回退解析 script.md")
+                script_beats = None
+
+        if script_beats is None:
+            script_path = config['paths']['script_outline']
+            if os.path.exists(script_path) and script_beats is None:
+                logger.info(f"预加载剧本大纲: {script_path}")
+                script_beats = parse_script_outline(script_path)
+                if script_beats:
+                    logger.info(f"剧本解析完成: {len(script_beats)} 个情节点")
+                    for beat in script_beats:
+                        logger.info(f"  - {beat.act} / {beat.beat_id}: {beat.content[:40]}...")
+                else:
+                    logger.warning("未能从剧本大纲解析出任何情节点，后续阶段可能无法生成剧本驱动配音")
 
     # 执行各阶段
     shots = None
