@@ -15,7 +15,7 @@ import argparse
 import urllib.request
 import urllib.error
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict
 
 # 把项目根目录加入路径
 ROOT = Path(__file__).parent.parent.resolve()
@@ -24,10 +24,14 @@ sys.path.insert(0, str(ROOT))
 from src.utils import logger, ensure_dir
 
 
-# Qwen3-8B GGUF 发布源
-# 优先使用 Unsloth 镜像，国内用户可换镜像或本地下载后改名
-DEFAULT_REPO = "unsloth/Qwen3-8B-GGUF"
-BACKUP_REPO = "Qwen/Qwen3-8B-GGUF"
+# Qwen3-8B GGUF 发布源（按顺序尝试）
+# 国内用户优先走 hf-mirror 或 modelscope
+REPOS = [
+    {"name": "hf-mirror", "repo": "unsloth/Qwen3-8B-GGUF", "url_template": "https://hf-mirror.com/{repo}/resolve/main/{filename}"},
+    {"name": "modelscope", "repo": "qwen/Qwen3-8B-GGUF", "url_template": "https://modelscope.cn/models/{repo}/resolve/master/{filename}"},
+    {"name": "huggingface-unsloth", "repo": "unsloth/Qwen3-8B-GGUF", "url_template": "https://huggingface.co/{repo}/resolve/main/{filename}"},
+    {"name": "huggingface-qwen", "repo": "Qwen/Qwen3-8B-GGUF", "url_template": "https://huggingface.co/{repo}/resolve/main/{filename}"},
+]
 
 QUANT_FILE_MAP = {
     "Q4_K_M": "qwen3-8b-q4_k_m.gguf",
@@ -46,7 +50,7 @@ QUANT_VRAM_MB = {
 
 
 def detect_available_vram_mb() -> float:
-    """检测可用显存（MB）。优先 nvidia-smi，其次 torch.cuda"""
+    """检测可用显存（MB）。优先 nvidia-smi，取最大可用 GPU；其次 torch.cuda"""
     try:
         import subprocess
         result = subprocess.run(
@@ -54,9 +58,12 @@ def detect_available_vram_mb() -> float:
             capture_output=True, text=True, check=False
         )
         if result.returncode == 0:
-            free_mb = float(result.stdout.strip().split("\n")[0])
-            logger.info(f"nvidia-smi 检测到可用显存: {free_mb:.0f} MB")
-            return free_mb
+            lines = [l.strip() for l in result.stdout.strip().split("\n") if l.strip()]
+            free_mbs = [float(l) for l in lines]
+            if free_mbs:
+                best = max(free_mbs)
+                logger.info(f"nvidia-smi 检测到可用显存: {free_mbs} MB，取最大: {best:.0f} MB")
+                return best
     except Exception as e:
         logger.debug(f"nvidia-smi 不可用: {e}")
 
@@ -126,10 +133,11 @@ def download_file(url: str, dest: Path) -> bool:
         return False
 
 
-def try_download(repo: str, quant: str, dest: Path) -> bool:
-    """尝试从指定仓库下载指定量化文件"""
+def try_download(repo_info: Dict[str, str], quant: str, dest: Path) -> bool:
+    """尝试从指定镜像下载指定量化文件"""
     filename = QUANT_FILE_MAP[quant]
-    url = f"https://huggingface.co/{repo}/resolve/main/{filename}"
+    url = repo_info["url_template"].format(repo=repo_info["repo"], filename=filename)
+    logger.info(f"尝试镜像: {repo_info['name']} ({repo_info['repo']})")
     return download_file(url, dest)
 
 
@@ -192,10 +200,12 @@ def main():
     if dest.exists():
         logger.info(f"目标文件已存在，跳过下载: {dest}")
     else:
-        ok = try_download(DEFAULT_REPO, quant, dest)
-        if not ok:
-            logger.warning(f"主仓库失败，尝试备用仓库: {BACKUP_REPO}")
-            ok = try_download(BACKUP_REPO, quant, dest)
+        ok = False
+        for repo_info in REPOS:
+            ok = try_download(repo_info, quant, dest)
+            if ok:
+                logger.info(f"镜像 {repo_info['name']} 下载成功")
+                break
         if not ok:
             logger.error("下载失败，请检查网络或手动下载后放到 models/local/")
             sys.exit(1)
