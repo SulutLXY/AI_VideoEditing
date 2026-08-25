@@ -234,41 +234,41 @@ def main():
                 for beat in script_beats:
                     logger.info(f"  - {beat.act} / {beat.beat_id}: {beat.content[:40]}...")
 
-                # 用 LLM 分析剧本节奏，为每个 beat 分配目标时长
-                beat_analysis = {}
-                try:
-                    llm_service = LLMService(config)
-                    target_duration = parse_duration_string(config['project'].get('target_duration', 0))
-                    beat_analysis = llm_service.analyze_script_beats(script_beats, target_duration)
-                    if beat_analysis:
-                        for beat in script_beats:
-                            info = beat_analysis.get(beat.beat_id)
-                            if info:
-                                beat.estimated_duration = info.get("estimated_duration", 0.0)
-                                beat.pace = info.get("pace", "正常")
-                                beat.emotion_intensity = info.get("emotion_intensity", 0.0)
-                                beat.priority = info.get("priority", 3)
-                                beat.required_shots_count = info.get("required_shots_count", 1)
-                        # 解析对白，生成 voice_cast 和 dialogue_entries
-                        try:
-                            planner = DialoguePlanner(config)
-                            script_beats, _ = planner.plan(script_beats)
-                        except Exception as e:
-                            logger.warning(f"对白规划失败，将使用原始 key_dialogue: {e}")
+            # 用 LLM 分析剧本节奏，为每个 beat 分配目标时长（无论是否预加载都执行）
+            beat_analysis = {}
+            try:
+                llm_service = LLMService(config)
+                target_duration = parse_duration_string(config['project'].get('target_duration', 0))
+                beat_analysis = llm_service.analyze_script_beats(script_beats, target_duration)
+                if beat_analysis:
+                    for beat in script_beats:
+                        info = beat_analysis.get(beat.beat_id)
+                        if info:
+                            beat.estimated_duration = info.get("estimated_duration", 0.0)
+                            beat.pace = info.get("pace", "正常")
+                            beat.emotion_intensity = info.get("emotion_intensity", 0.0)
+                            beat.priority = info.get("priority", 3)
+                            beat.required_shots_count = info.get("required_shots_count", 1)
+                    # 解析对白，生成 voice_cast 和 dialogue_entries
+                    try:
+                        planner = DialoguePlanner(config)
+                        script_beats, _ = planner.plan(script_beats)
+                    except Exception as e:
+                        logger.warning(f"对白规划失败，将使用原始 key_dialogue: {e}")
 
-                        save_json(
-                            {"beats": [b.to_dict() for b in script_beats], "analysis": beat_analysis},
-                            os.path.join(output_dir, 'script_beats_analysis.json')
+                    save_json(
+                        {"beats": [b.to_dict() for b in script_beats], "analysis": beat_analysis},
+                        os.path.join(output_dir, 'script_beats_analysis.json')
+                    )
+                    logger.info(f"剧本节奏分析完成，已保存: {os.path.join(output_dir, 'script_beats_analysis.json')}")
+                    logger.info("各 beat 目标时长分配:")
+                    for beat in script_beats:
+                        logger.info(
+                            f"  - {beat.beat_id}: {beat.estimated_duration:.1f}s, "
+                            f"节奏={beat.pace}, 优先级={beat.priority}, 情绪={beat.emotion_intensity:.1f}"
                         )
-                        logger.info(f"剧本节奏分析完成，已保存: {os.path.join(output_dir, 'script_beats_analysis.json')}")
-                        logger.info("各 beat 目标时长分配:")
-                        for beat in script_beats:
-                            logger.info(
-                                f"  - {beat.beat_id}: {beat.estimated_duration:.1f}s, "
-                                f"节奏={beat.pace}, 优先级={beat.priority}, 情绪={beat.emotion_intensity:.1f}"
-                            )
-                except Exception as e:
-                    logger.warning(f"剧本节奏分析失败，将使用平均时长分配: {e}")
+            except Exception as e:
+                logger.warning(f"剧本节奏分析失败，将使用平均时长分配: {e}")
 
             if shots is None:
                 # 1) 优先从 --input-json 或 phase1_analysis.json 加载
