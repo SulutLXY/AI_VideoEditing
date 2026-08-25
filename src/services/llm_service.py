@@ -17,6 +17,15 @@ from src.utils import logger
 class LLMService:
     """大语言模型服务"""
 
+    ENV_MAP = {
+        "openai": "OPENAI_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
+        "doubao": "ARK_API_KEY",
+        "volcengine": "ARK_API_KEY",
+        "qwen": "DASHSCOPE_API_KEY",
+        "custom": "OPENAI_API_KEY",
+    }
+
     def __init__(self, config: Dict[str, Any]):
         self.config = config.get("models", {}).get("llm", {})
         self.provider = self.config.get("provider", "deepseek")
@@ -31,15 +40,7 @@ class LLMService:
         if api_key:
             return api_key
 
-        env_map = {
-            "openai": "OPENAI_API_KEY",
-            "deepseek": "DEEPSEEK_API_KEY",
-            "doubao": "ARK_API_KEY",
-            "volcengine": "ARK_API_KEY",
-            "qwen": "DASHSCOPE_API_KEY",
-            "custom": "OPENAI_API_KEY",
-        }
-        env_name = env_map.get(self.provider, "OPENAI_API_KEY")
+        env_name = self.ENV_MAP.get(self.provider, "OPENAI_API_KEY")
         return os.environ.get(env_name, "")
 
     def _init_client(self):
@@ -55,7 +56,7 @@ class LLMService:
             if not api_key:
                 raise RuntimeError(
                     f"LLM provider '{self.provider}' 缺少 API Key。请在 config.yaml 中设置 models.llm.api_key "
-                    f"或设置环境变量 {env_map.get(self.provider, 'OPENAI_API_KEY')}。"
+                    f"或设置环境变量 {self.ENV_MAP.get(self.provider, 'OPENAI_API_KEY')}。"
                 )
 
             return openai.OpenAI(
