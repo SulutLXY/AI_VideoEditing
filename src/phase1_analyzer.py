@@ -186,6 +186,8 @@ class Phase1Analyzer:
                 cv_meta=rough_shot.cv_metadata,
                 source_file=rough_shot.source_file,
                 source_path=rough_shot.source_path,
+                tc_in=rough_shot.tc_in,
+                tc_out=rough_shot.tc_out,
             )
             shots.extend(analyzed)
 

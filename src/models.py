@@ -126,6 +126,9 @@ class ScriptBeat:
     emotion: str
     key_actions: List[str] = field(default_factory=list)
     key_dialogue: str = ""
+    # 角色性别/状态信息（由剧本分析或 LLM 填充）
+    gender_state: str = ""                   # 本 beat 主要角色的性别/状态，如 "男装"/"女装"
+    gender_transition: str = ""                # 本 beat 是否发生状态切换，如 "男装→女装"
     # 由 LLM 剧情节奏分析填充
     estimated_duration: float = 0.0          # 该 beat 建议时长（秒）
     pace: str = "正常"                        # 节奏标签：爆发/快/正常/慢/静止
@@ -134,6 +137,8 @@ class ScriptBeat:
     required_shots_count: int = 1            # 建议最少镜头数
     # 由 dialogue_planner 生成，驱动后续配音
     dialogue_entries: List[DialogueEntry] = field(default_factory=list)
+    # 由 Phase 2 生成：每个 beat 拆解后的 sub-beat / 分镜点列表
+    sub_beats: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self):
         data = asdict(self)
@@ -142,7 +147,7 @@ class ScriptBeat:
 
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "ScriptBeat":
-        """从字典重建 ScriptBeat，兼容旧版无 analysis 字段"""
+        """从字典重建 ScriptBeat，兼容旧版无 analysis/sub_beats 字段"""
         if not data:
             data = {}
         beat = ScriptBeat(
@@ -155,6 +160,8 @@ class ScriptBeat:
             emotion=data.get("emotion", ""),
             key_actions=data.get("key_actions") or [],
             key_dialogue=data.get("key_dialogue", ""),
+            gender_state=data.get("gender_state", ""),
+            gender_transition=data.get("gender_transition", ""),
             estimated_duration=float(data.get("estimated_duration", 0.0) or 0.0),
             pace=data.get("pace", "正常"),
             emotion_intensity=float(data.get("emotion_intensity", 0.0) or 0.0),
@@ -164,6 +171,7 @@ class ScriptBeat:
         beat.dialogue_entries = [
             DialogueEntry.from_dict(e) for e in (data.get("dialogue_entries") or [])
         ]
+        beat.sub_beats = list(data.get("sub_beats") or [])
         return beat
 
     @property

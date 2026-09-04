@@ -132,34 +132,50 @@ class DialoguePlanner:
     ) -> Tuple[List[DialogueEntry], Dict[str, str]]:
         """解析一个 beat 的 key_dialogue，返回 dialogue_entries 和更新后的状态机"""
         entries: List[DialogueEntry] = []
+
+        # 优先使用 beat 显式标记的性别状态/切换
+        character_states = self._apply_beat_gender_state(
+            beat, character_states, before_dialogue=True
+        )
+
         if not beat.key_dialogue:
+            # 无对白也要应用状态切换的后半部分，保证下一 beat 状态正确
+            character_states = self._apply_beat_gender_state(
+                beat, character_states, before_dialogue=False
+            )
             return entries, character_states
 
         # 关键台词可能是纯引号文本（无说话人前缀），先尝试拆出所有引号内对白
         raw_text = beat.key_dialogue.strip()
-        quoted_segments = self._extract_quoted_segments(raw_text)
 
-        if quoted_segments:
-            dialogue_items = []
-            for segment in quoted_segments:
-                parsed = self._parse_dialogue_line(segment)
-                if parsed:
-                    dialogue_items.append(parsed)
-                else:
-                    # 只有纯文本，没有说话人前缀，从 beat.content 推断
-                    speaker, stage_direction = self._infer_speaker_and_direction(beat.content)
-                    text = segment.strip('""').strip()
-                    dialogue_items.append((speaker, stage_direction, text))
-        else:
-            # 没有引号，按行尝试解析说话人前缀格式
-            dialogue_items = []
-            for line in raw_text.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                parsed = self._parse_dialogue_line(line)
-                if parsed:
-                    dialogue_items.append(parsed)
+        # 优先尝试解析带说话人前缀的整行/多行对白
+        dialogue_items = []
+        has_explicit_speaker = False
+        for line in raw_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parsed = self._parse_dialogue_line(line)
+            if parsed:
+                dialogue_items.append(parsed)
+                has_explicit_speaker = True
+
+        # 如果没有解析出带说话人前缀的对白，再尝试从引号中提取纯文本
+        if not has_explicit_speaker:
+            quoted_segments = self._extract_quoted_segments(raw_text)
+            if quoted_segments:
+                for segment in quoted_segments:
+                    parsed = self._parse_dialogue_line(segment)
+                    if parsed:
+                        dialogue_items.append(parsed)
+                    else:
+                        # 只有纯文本，没有说话人前缀，从 beat.content 推断
+                        speaker, stage_direction = self._infer_speaker_and_direction(beat.content)
+                        text = segment.strip('""').strip()
+                        dialogue_items.append((speaker, stage_direction, text))
+            else:
+                # 既没有引号也没有说话人前缀，整段按无对白处理
+                pass
 
         for speaker, stage_direction, text in dialogue_items:
             if not text:
@@ -200,6 +216,11 @@ class DialoguePlanner:
             beat.content, character_states
         )
 
+        # 应用 beat 显式标记的状态切换后半部分（如男装→女装最终切到女装）
+        character_states = self._apply_beat_gender_state(
+            beat, character_states, before_dialogue=False
+        )
+
         return entries, character_states
 
     @staticmethod
@@ -219,7 +240,7 @@ class DialoguePlanner:
         if m:
             speaker = m.group(1).strip()
             stage_direction = m.group(2).strip()
-            text = m.group(3).strip()
+            text = m.group(3).strip().strip('""').strip()
             return speaker, stage_direction, text
 
         # 没有状态括号，只匹配「说话人：文本」
@@ -227,7 +248,7 @@ class DialoguePlanner:
         m2 = re.match(pattern2, line)
         if m2:
             speaker = m2.group(1).strip()
-            text = m2.group(2).strip()
+            text = m2.group(2).strip().strip('""').strip()
             return speaker, "", text
 
         # 完全无法解析，视作无对白
@@ -316,6 +337,32 @@ class DialoguePlanner:
             character_states["云琛"] = "女装"
         elif any(k in content for k in ["压低嗓音", "男人腔", "男声", "粗声"]):
             character_states["云琛"] = "男装"
+
+        return character_states
+
+    def _apply_beat_gender_state(
+        self,
+        beat: ScriptBeat,
+        character_states: Dict[str, str],
+        before_dialogue: bool = True,
+    ) -> Dict[str, str]:
+        """
+        应用 beat 显式标记的 gender_state / gender_transition。
+        - before_dialogue=True：若存在 transition，取前半部分作为当前状态；否则用 gender_state。
+        - before_dialogue=False：若存在 transition，取后半部分作为下一 beat 的起始状态。
+        """
+        transition = (beat.gender_transition or "").strip()
+        if transition:
+            parts = [p.strip() for p in re.split(r"[→\-\>\/]", transition) if p.strip()]
+            if len(parts) >= 2:
+                if before_dialogue:
+                    character_states["云琛"] = parts[0]
+                else:
+                    character_states["云琛"] = parts[-1]
+            elif len(parts) == 1:
+                character_states["云琛"] = parts[0]
+        elif beat.gender_state:
+            character_states["云琛"] = beat.gender_state
 
         return character_states
 

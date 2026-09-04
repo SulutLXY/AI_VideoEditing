@@ -17,12 +17,13 @@ Phase 3: 剪辑语法决策（精剪方案生成）
 import os
 import json
 import re
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional, Set, Tuple
 from collections import defaultdict
 from dataclasses import dataclass, asdict
 
 from src.utils import Shot, save_json, load_json, logger, parse_duration_string, tc_to_sec
 from src.services.llm_service import LLMService
+from src.phase3_subbeat_editor import SubBeatPhase3Editor
 
 
 @dataclass
@@ -38,10 +39,15 @@ class EditDecision:
     transition: str     # 转场
     audio: str          # 音频处理
     purpose: str        # 叙事目的
-    notes: str = ""     # 备注
-    beat_id: str = ""   # 所属情节点
-    act: str = ""       # 所属幕
-    scene: str = ""     # 所属场
+    notes: str = ""             # 备注
+    beat_id: str = ""           # 所属情节点
+    sub_beat_id: str = ""       # 所属 sub-beat
+    act: str = ""               # 所属幕
+    scene: str = ""             # 所属场
+    source_path: str = ""       # 原始素材路径
+    duration_sec: float = 0.0   # 原始时长
+    raw_duration: float = 0.0   # 兼容字段
+    sequence_in_sub: int = 0    # 在 sub-beat 内顺序
 
     def to_dict(self):
         return asdict(self)
@@ -64,6 +70,7 @@ class Phase3Editor:
         self.prompt_template = self._load_prompt_template()
         self.llm_service = LLMService(config)
         self.beat_map = self._load_script_beats()
+        self.use_subbeat = config.get("phase3", {}).get("use_subbeat", True)
 
     def _load_prompt_template(self) -> str:
         """加载 Prompt 模板，失败时回退到内置最小模板"""
@@ -107,11 +114,59 @@ class Phase3Editor:
     # 主入口
     # ------------------------------------------------------------------
     def run(self, shots: List[Shot]) -> List[EditDecision]:
-        """执行剪辑语法决策"""
+        """执行剪辑语法决策
+
+        默认走基于 sub-beat 的迭代式剪辑流程（含本地 VLM 终审）。
+        当配置 phase3.use_subbeat=false 或 sub-beat 流程失败时回退到旧流程。
+        """
         logger.info("=" * 60)
         logger.info("Phase 3: 剪辑语法决策")
         logger.info("=" * 60)
 
+        if self.use_subbeat:
+            try:
+                logger.info("[Phase3] 启用基于 sub-beat 的迭代式剪辑流程")
+                return self._run_subbeat_pipeline(shots)
+            except Exception as e:
+                logger.error(f"[Phase3] sub-beat 流程失败，回退到旧流程: {e}")
+
+        return self._run_legacy_pipeline(shots)
+
+    def _run_subbeat_pipeline(self, shots: List[Shot]) -> List[EditDecision]:
+        """基于 sub-beat 的新流程"""
+        editor = SubBeatPhase3Editor(self.config)
+        decisions_dict = editor.run(shots)
+
+        # 把 dict 转成 EditDecision 对象
+        decisions: List[EditDecision] = []
+        for d in decisions_dict:
+            if isinstance(d, EditDecision):
+                decisions.append(d)
+                continue
+            decisions.append(EditDecision(
+                sequence=d.get("sequence", 0),
+                shot_id=d.get("shot_id", ""),
+                source_file=d.get("source_file", ""),
+                tc_in=d.get("tc_in") or d.get("source_in", "00:00:00:00"),
+                tc_out=d.get("tc_out") or d.get("source_out", "00:00:00:00"),
+                speed=d.get("speed", "1x"),
+                technique=d.get("technique", "连续剪辑"),
+                transition=d.get("transition", "硬切"),
+                audio=d.get("audio", "保留原声"),
+                purpose=d.get("purpose", ""),
+                notes=d.get("notes", ""),
+                beat_id=d.get("beat_id", ""),
+                sub_beat_id=d.get("sub_beat_id", ""),
+                act=d.get("act", ""),
+                scene=d.get("scene", ""),
+            ))
+
+        # 导出 CSV
+        self._export_csv(decisions)
+        return decisions
+
+    def _run_legacy_pipeline(self, shots: List[Shot]) -> List[EditDecision]:
+        """旧版流程（保留作为 fallback）"""
         valid_statuses = {"核心", "保留", "备选", "强制保留", "待复核"}
         kept_shots = [s for s in shots if getattr(s, 'status', '保留') in valid_statuses]
         logger.info(f"待决策镜头数: {len(kept_shots)}")
@@ -745,6 +800,19 @@ class Phase3Editor:
             available_supplements = [s for s in available_supplements if s.shot_id != best_sup.shot_id]
             supplement_count += 1
 
+        # 强制同 beat 语义去重：避免同一 beat 内出现多个重复/功能重叠镜头
+        selected = self._dedup_within_beat(selected, shot_map, beat_id)
+
+        # 强制检查关键动作覆盖：状态转换/核心动作 beat 必须被镜头覆盖
+        selected = self._ensure_key_action_coverage(
+            beat_id=beat_id,
+            selected=selected,
+            supplement_shots=available_candidates + available_supplements,
+            shot_map=shot_map,
+            used_shot_ids=used_shot_ids,
+            used_source_files=used_source_files,
+        )
+
         # 最终兜底：统一变速
         raw_dur = sum(shot_map[d.shot_id].duration_sec for d in selected if d.shot_id in shot_map)
         if raw_dur > 0:
@@ -753,6 +821,219 @@ class Phase3Editor:
             self._apply_uniform_speed(selected, clamped_mult, beat_id)
 
         return selected
+
+    def _dedup_within_beat(
+        self,
+        selected: List[EditDecision],
+        shot_map: Dict[str, Shot],
+        beat_id: str,
+    ) -> List[EditDecision]:
+        """
+        同一 beat 内去重：语义高度重叠，或来自同一 source_file 的时间窗口重叠/相邻，
+        只保留评分更高的一个。保护强制保留/待复核素材和状态转换核心镜头。
+        """
+        if len(selected) <= 1:
+            return selected
+
+        protected_statuses = {"强制保留", "待复核"}
+        kept = []
+        removed_ids = set()
+
+        def _shot_interval(s: Shot) -> Tuple[float, float]:
+            fps = s.fps or 24.0
+            try:
+                return tc_to_sec(s.tc_in, fps), tc_to_sec(s.tc_out, fps)
+            except Exception:
+                return 0.0, s.duration_sec
+
+        # 按 quality_score 降序排列，优先保留高质量镜头
+        sorted_decisions = sorted(
+            selected,
+            key=lambda d: (
+                1 if getattr(shot_map.get(d.shot_id), "status", "") in protected_statuses else 0,
+                shot_map.get(d.shot_id, Shot("", "", "", "", "", "", 0.0)).quality_score,
+                d.shot_id,
+            ),
+            reverse=True,
+        )
+
+        for d in sorted_decisions:
+            if d.shot_id in removed_ids:
+                continue
+            shot = shot_map.get(d.shot_id)
+            if not shot:
+                kept.append(d)
+                continue
+
+            # 保护强制保留/待复核
+            if getattr(shot, "status", "") in protected_statuses:
+                kept.append(d)
+                continue
+
+            a_in, a_out = _shot_interval(shot)
+            dup_with = None
+            dup_reason = ""
+
+            for kept_d in kept:
+                kept_shot = shot_map.get(kept_d.shot_id)
+                if not kept_shot:
+                    continue
+
+                # 1. 同一 source_file 时间重叠或相邻（<0.5s）视为重复
+                if shot.source_file and shot.source_file == kept_shot.source_file:
+                    b_in, b_out = _shot_interval(kept_shot)
+                    if a_in < b_out + 0.5 and b_in < a_out + 0.5:
+                        dup_with = kept_d
+                        dup_reason = "同素材时间重叠/相邻"
+                        break
+
+                # 2. 语义相似度阈值
+                sim = self._shot_semantic_similarity(shot, kept_shot)
+                if sim >= 0.55:
+                    dup_with = kept_d
+                    dup_reason = f"语义相似度 {sim:.2f}"
+                    break
+
+            if dup_with:
+                logger.info(
+                    f"beat {beat_id} 同 beat 去重: 移除 {d.shot_id}，与 {dup_with.shot_id} {dup_reason}"
+                )
+                removed_ids.add(d.shot_id)
+            else:
+                kept.append(d)
+
+        # 保持原始顺序
+        final = [d for d in selected if d.shot_id not in removed_ids]
+        return final
+
+    @staticmethod
+    def _shot_semantic_similarity(a: Shot, b: Shot) -> float:
+        """计算两个镜头描述的语义相似度（Jaccard）"""
+        def _shot_text(s: Shot) -> str:
+            return " ".join(filter(None, [
+                s.action or "",
+                s.action_details or "",
+                s.asr_text or "",
+                s.dialogue or "",
+                ", ".join(s.key_objects or []),
+                s.shot_size or "",
+                s.camera_position or "",
+            ]))
+
+        tokens_a = Phase3Editor._tokens(_shot_text(a))
+        tokens_b = Phase3Editor._tokens(_shot_text(b))
+        if not tokens_a or not tokens_b:
+            return 0.0
+        inter = tokens_a & tokens_b
+        union = tokens_a | tokens_b
+        if not union:
+            return 0.0
+        return len(inter) / len(union)
+
+    def _ensure_key_action_coverage(
+        self,
+        beat_id: str,
+        selected: List[EditDecision],
+        supplement_shots: List[Shot],
+        shot_map: Dict[str, Shot],
+        used_shot_ids: Set[str],
+        used_source_files: Set[str],
+    ) -> List[EditDecision]:
+        """
+        检查当前 beat 的关键动作是否被已选镜头覆盖。
+        若缺失，从备选池强制补充一个最匹配的镜头。
+        """
+        beat_info = self.beat_map.get(beat_id, {})
+        key_actions = beat_info.get("key_actions", [])
+        gender_transition = beat_info.get("gender_transition", "")
+
+        # 把状态转换也作为一个必须覆盖的"动作"，但避免与 key_actions 重复
+        if gender_transition and gender_transition not in key_actions:
+            key_actions = list(key_actions) + [gender_transition]
+
+        if not key_actions:
+            return selected
+
+        # 已选镜头文本
+        selected_shots = [shot_map[d.shot_id] for d in selected if d.shot_id in shot_map]
+
+        action_threshold = 0.18  # 覆盖阈值（语义匹配更宽松）
+        missing_actions = []
+        for action in key_actions:
+            best_fit = max(
+                (self._semantic_fit_for_action(shot, action) for shot in selected_shots),
+                default=0.0
+            )
+            if best_fit < action_threshold:
+                missing_actions.append((action, best_fit))
+
+        if not missing_actions:
+            return selected
+
+        logger.info(
+            f"beat {beat_id} 关键动作覆盖不足: "
+            f"{[(a, f'{s:.2f}') for a, s in missing_actions]}, 尝试补充镜头"
+        )
+
+        # 从备选池选最能覆盖缺失动作的镜头
+        best_sup = None
+        best_score = -999.0
+        for sup in supplement_shots:
+            if sup.shot_id in used_shot_ids:
+                continue
+            score = 0.0
+            for action, _ in missing_actions:
+                fit = self._semantic_fit_for_action(sup, action)
+                # 状态转换关键词额外奖励
+                if gender_transition and any(k in (sup.action_details or "") for k in ["女装", "男装", "换装", "变身", "长裙", "长袍"]):
+                    fit += 0.25
+                score += fit
+            if score > best_score:
+                best_score = score
+                best_sup = sup
+
+        if best_sup and best_score > 0:
+            logger.info(
+                f"beat {beat_id} 补充关键动作镜头: {best_sup.shot_id} "
+                f"(覆盖分={best_score:.2f}, 缺失动作={[a for a, _ in missing_actions]})"
+            )
+            selected.append(self._shot_to_decision(
+                best_sup, "1x", beat_id=beat_id,
+                purpose=f"强制补充关键动作: {', '.join(a for a, _ in missing_actions)}",
+                notes=f"[关键动作覆盖] 补充缺失动作: {', '.join(a for a, _ in missing_actions)}"
+            ))
+            used_shot_ids.add(best_sup.shot_id)
+            used_source_files.add(best_sup.source_file)
+        else:
+            logger.warning(f"beat {beat_id} 无备选镜头可补充缺失动作")
+
+        return selected
+
+    def _semantic_fit_for_action(self, shot: Shot, action_text: str) -> float:
+        """计算单个镜头与某个关键动作的语义匹配度 0-1"""
+        shot_text = " ".join(filter(None, [
+            shot.action or "",
+            shot.action_details or "",
+            shot.asr_text or "",
+            shot.dialogue or "",
+            ", ".join(shot.key_objects or []),
+        ]))
+        if not shot_text:
+            return 0.0
+
+        action_tokens = self._tokens(action_text)
+        shot_tokens = self._tokens(shot_text)
+        if not action_tokens or not shot_tokens:
+            return 0.0
+
+        overlap = action_tokens & shot_tokens
+        if not overlap:
+            return 0.0
+        recall = len(overlap) / len(action_tokens)
+        precision = len(overlap) / len(shot_tokens)
+        if recall + precision <= 0:
+            return 0.0
+        return 2 * recall * precision / (recall + precision)
 
     def _ensure_beat_meta(self, d: EditDecision, shot_map: Dict[str, Shot]):
         """确保 EditDecision 的 beat_id/act/scene 字段已填充"""
@@ -1204,7 +1485,7 @@ class Phase3Editor:
         }
         text = str(text).strip().lower()
         words: Set[str] = set()
-        # 按标点分词
+        # 按标点分词（支持中文逗号、顿号）
         delimiters = set("，、。！？；：""''（）(),.!?;:\"'() ")
         current = ""
         for ch in text:

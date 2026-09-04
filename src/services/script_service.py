@@ -208,6 +208,8 @@ class ScriptPreprocessor:
             b.setdefault("emotion", "")
             b.setdefault("key_actions", [])
             b.setdefault("key_dialogue", "")
+            b.setdefault("gender_state", "")
+            b.setdefault("gender_transition", "")
             b.setdefault("suggested_shots", "")
         return beats
 
@@ -253,7 +255,16 @@ class ScriptPreprocessor:
 - emotion: 情绪
 - key_actions: 关键动作数组
 - key_dialogue: 关键台词（如有，保留原文；没有则空字符串）
+- gender_state: 本情节点中主要角色的性别/状态（如云琛"男装"、"女装"、小六""；没有则空字符串）
+- gender_transition: 本情节点是否发生性别/状态切换（如"男装→女装"、"女装→男装"；无切换则空字符串）
 {shot_requirements}
+
+特殊要求：
+1. 如果剧情中出现"换装"、"变身"、"露出女装"、"穿上男装"等角色状态转换动作，请把这些转换单独拆分成一个情节点，不要把转换和前后的动作混在一起。
+2. 拆分示例：
+   - "追猫→跃起变女装→接猫" 应拆为两个 beat："追猫" 和 "跃起变女装/接猫"
+   - "女装撸猫→听到声音→穿回男装" 应拆为两个 beat："女装听到声音" 和 "扔饼/穿回男装"
+3. 每个 beat 的 key_actions 必须包含能推动剧情发展的核心动作，避免只写"站立"、"看"等无信息动作。
 
 ## 这场戏的内容
 {scene_text}
@@ -313,6 +324,10 @@ class ScriptPreprocessor:
                     actions = [a.strip() for a in actions.split(",") if a.strip()]
                 lines.append(f"- 关键动作：{'，'.join(actions)}")
                 lines.append(f"- 关键台词：\"{b.get('key_dialogue', '')}\"")
+                if b.get("gender_state"):
+                    lines.append(f"- 性别状态：{b.get('gender_state')}")
+                if b.get("gender_transition"):
+                    lines.append(f"- 状态切换：{b.get('gender_transition')}")
                 if self.output_shot_requirements and b.get("suggested_shots"):
                     lines.append(f"- 建议镜头：{b.get('suggested_shots')}")
                 lines.append("")

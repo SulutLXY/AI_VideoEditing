@@ -292,12 +292,25 @@ class Phase4Exporter:
         """导出完整 JSON 数据"""
         json_path = os.path.join(self.output_dir, 'timeline.json')
 
+        # 保留 Phase 3 终审结果（如果存在）
+        phase3_metadata = {}
+        if os.path.exists(json_path):
+            try:
+                from src.utils import load_json
+                old = load_json(json_path)
+                for key in ['passed', 'total_score', 'attempt', 'target_duration']:
+                    if key in old:
+                        phase3_metadata[key] = old[key]
+            except Exception:
+                pass
+
         data = {
             'project': self.project,
             'export_time': datetime.now().isoformat(),
             'total_clips': len(matched),
             'timeline': []
         }
+        data.update(phase3_metadata)
 
         timeline_tc = 0.0
         for decision, shot in matched:

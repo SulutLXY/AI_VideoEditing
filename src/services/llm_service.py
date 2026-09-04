@@ -137,7 +137,10 @@ class LLMService:
             "4. emotion_intensity: 情绪强度，0.0-5.0。\n"
             "5. priority: 剧情重要性，1-5，5 为最高。关键转折/高潮给 5，过渡给 2-3。\n"
             "6. required_shots_count: 完成该 beat 叙事所需的最少镜头数，建议 1-3。\n"
-            "7. reasoning: 为什么这样分配。\n\n"
+            "7. key_actions: 字符串数组，该 beat 必须用镜头覆盖的核心动作（如 ['奔跑追猫','黑猫上檐']）。\n"
+            "8. gender_state: 该 beat 中主要角色的性别/状态，如 '男装' / '女装' / ''。\n"
+            "9. gender_transition: 该 beat 是否发生状态切换，如 '男装→女装' / '女装→男装' / ''。\n"
+            "10. reasoning: 为什么这样分配。\n\n"
             f"可用的 beat_id 列表（必须严格使用这些键名）：{beat_ids_text}\n\n"
             "输出格式（严格 JSON）：\n"
             "{\n"
@@ -174,17 +177,31 @@ class LLMService:
             # 把可能的缩写映射回完整 beat_id
             beat_id = full_beat_ids.get(raw_key) or alias_map.get(raw_key) or raw_key
             try:
+                key_actions = data.get("key_actions") or []
+                if isinstance(key_actions, str):
+                    key_actions = [a.strip() for a in key_actions.split(",") if a.strip()]
                 result[str(beat_id)] = {
                     "estimated_duration": float(data.get("estimated_duration", 0.0) or 0.0),
                     "pace": str(data.get("pace", "正常")),
                     "emotion_intensity": float(data.get("emotion_intensity", 0.0) or 0.0),
                     "priority": int(data.get("priority", 3) or 3),
                     "required_shots_count": int(data.get("required_shots_count", 1) or 1),
+                    "key_actions": key_actions,
+                    "gender_state": str(data.get("gender_state", "")),
+                    "gender_transition": str(data.get("gender_transition", "")),
                     "reasoning": str(data.get("reasoning", "")),
                 }
             except Exception as e:
                 logger.warning(f"解析 beat {beat_id} 的节奏分析结果失败: {e}")
                 continue
+
+        # 后处理：优先保留剧本大纲中原有的关键动作，避免 LLM 改写导致 beat 语义混淆
+        for b in script_beats:
+            if b.beat_id in result and b.key_actions:
+                original_actions = [a.strip() for a in b.key_actions if a.strip()]
+                if original_actions:
+                    result[b.beat_id]["key_actions"] = original_actions
+                    logger.info(f"保留 beat {b.beat_id} 原始关键动作: {original_actions}")
 
         # 校验总时长
         total_est = sum(v["estimated_duration"] for v in result.values())
@@ -203,23 +220,35 @@ class LLMService:
     def _shot_config_text(shot: Shot) -> str:
         """从 Shot 和 shot_config 中提取用于 LLM 匹配的文本描述"""
         cfg = (shot.cv_metadata or {}).get("shot_config", {})
+
+        def _list(val):
+            if not val:
+                return []
+            if isinstance(val, list):
+                return val
+            return [str(val)]
+
         lines = [
             f"镜头 {shot.shot_id}:",
             f"- 来源: {shot.source_file} {shot.tc_in}-{shot.tc_out}",
             f"- 内容摘要: {cfg.get('content_summary') or shot.action or '未知'}",
             f"- 场景: {cfg.get('location') or shot.location or '未知'}",
             f"- 时间: {cfg.get('time_of_day') or shot.time_of_day or '未知'}",
-            f"- 角色: {', '.join(cfg.get('characters') or shot.characters) or '未知'}",
+            f"- 角色: {', '.join(_list(cfg.get('characters') or shot.characters)) or '未知'}",
             f"- 景别: {cfg.get('shot_type') or shot.shot_size or '未知'}",
             f"- 机位: {cfg.get('camera_position') or shot.camera_position or '未知'}",
             f"- 运镜: {cfg.get('camera_movement') or shot.camera_movement or '未知'}",
             f"- 方向: {cfg.get('direction') or getattr(shot, 'direction', '') or '未知'}",
             f"- 动作: {cfg.get('action') or shot.action or '未知'}",
+            f"- 行为: {cfg.get('behavior') or shot.behavior or '未知'}",
+            f"- 主体: {cfg.get('primary_subject') or shot.primary_subject or '未知'}",
             f"- 情绪: {cfg.get('emotion') or shot.emotion or '未知'}",
-            f"- 风格/氛围: {cfg.get('style') or ''} {cfg.get('atmosphere') or ''}".strip(),
-            f"- 标签: {', '.join(cfg.get('tags') or shot.tags) or '无'}",
-            f"- 关键物体: {', '.join(cfg.get('key_objects') or shot.key_objects) or '无'}",
-            f"- 台词: {shot.asr_text or shot.dialogue or '无'}",
+            f"- 情绪强度: {cfg.get('emotion_intensity') or shot.emotion_intensity or '未知'}",
+            f"- 节奏: {cfg.get('pace') or shot.pace or '未知'}",
+            f"- 风格/氛围: {(cfg.get('style') or '')} {(cfg.get('atmosphere') or '')}".strip() or "无",
+            f"- 标签: {', '.join(_list(cfg.get('tags') or shot.tags)) or '无'}",
+            f"- 关键物体: {', '.join(_list(cfg.get('key_objects') or shot.key_objects)) or '无'}",
+            f"- 台词/ASR: {shot.asr_text or shot.dialogue or cfg.get('dialogue') or '无'}",
         ]
         return "\n".join(lines)
 
@@ -241,6 +270,8 @@ class LLMService:
             f"情绪: {b.emotion}\n"
             f"关键动作: {', '.join(b.key_actions)}\n"
             f"关键台词: {b.key_dialogue}\n"
+            f"性别状态: {b.gender_state or '无特殊要求'}\n"
+            f"状态转换: {b.gender_transition or '无'}\n"
             for i, b in enumerate(script_beats)
         ])
 
@@ -286,7 +317,19 @@ class LLMService:
             return []
 
         anchor_map = {}
-        batch_size = 15  # 减小批次，降低模型混淆概率
+        shot_map = {s.shot_id: s for s in shots}
+
+        # 来源文件名白名单：根据素材文件名前缀，限制可匹配的情节点范围
+        # 收紧规则：C招聘 只匹配 C2（小六画外音/云琛反应），B紧身 只匹配 C1/C2
+        source_beat_whitelist = {
+            "A追逐": {"场1-情节点A1", "场1-情节点A2"},
+            "B变身": {"场1-情节点A2", "场1-情节点B", "场1-情节点C2"},
+            "B紧身": {"场1-情节点C1", "场1-情节点C2"},
+            "C招聘": {"场1-情节点C2", "场1-情节点D", "场1-情节点E"},
+            "D小六": {"场1-情节点D", "场1-情节点E", "场1-情节点F", "场1-情节点G"},
+        }
+
+        batch_size = 10  # 减小批次，降低模型混淆概率
         for batch_start in range(0, len(shots), batch_size):
             batch = shots[batch_start:batch_start + batch_size]
             shots_text = "\n\n".join([self._shot_config_text(s) for s in batch])
@@ -340,7 +383,7 @@ class LLMService:
                         "reasoning": "",
                     }
 
-        # 后处理：过滤低置信度和非法 beat
+        # 后处理：过滤低置信度、非法 beat 和来源文件名白名单
         valid_beats = {b.beat_id for b in script_beats}
         confidence_threshold = self.config.get("phase2", {}).get("anchor_confidence_threshold", 0.7)
         for shot_id, anchor in list(anchor_map.items()):
@@ -354,6 +397,24 @@ class LLMService:
                 logger.warning(f" shot {shot_id} 对 {beat} 的置信度 {conf:.2f} 低于阈值 {confidence_threshold}，设为 UNMATCHED")
                 anchor["beat"] = "UNMATCHED"
                 anchor["reasoning"] = (anchor.get("reasoning", "") + f" [后处理：置信度 {conf:.2f} 过低]").strip()
+
+            # 来源文件名白名单校验（仅对成功匹配的 beat 做兜底）
+            shot = shot_map.get(shot_id)
+            if shot and beat in valid_beats:
+                source_file = shot.source_file or ""
+                for prefix, allowed in source_beat_whitelist.items():
+                    if prefix in source_file:
+                        if beat not in allowed:
+                            logger.warning(
+                                f" shot {shot_id} 来源文件 '{source_file}' 与 beat '{beat}' 不匹配，"
+                                f"根据白名单只允许 {allowed}，强制设为 UNMATCHED"
+                            )
+                            anchor["beat"] = "UNMATCHED"
+                            anchor["reasoning"] = (
+                                anchor.get("reasoning", "") + f" [后处理：来源文件 {source_file} 不在 {allowed} 白名单内]"
+                            ).strip()
+                        break
+
             anchor_map[shot_id] = anchor
 
         return anchor_map

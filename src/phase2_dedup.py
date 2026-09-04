@@ -105,6 +105,9 @@ class Phase2TakeSelector:
         # 1. 计算质量分
         self._compute_quality_scores(shots)
 
+        # 1.5 状态转换镜头强制保护：变装/换装 beat 必须保留一个镜头
+        self._boost_transition_shots(shots)
+
         # 2. 基于状态做初始标记
         self._initial_state_mark(shots)
 
@@ -159,6 +162,53 @@ class Phase2TakeSelector:
         logger.info("计算 Shot 质量分...")
         for shot in shots:
             shot.quality_score = self.quality_scorer.score(shot)
+
+    def _boost_transition_shots(self, shots: List[Shot]):
+        """
+        对包含'变装''换装''男装变女装''女装变男装'等状态转换的 beat，
+        若镜头描述匹配转换动作，则提升其状态为'核心'，避免在后续去重中被丢弃。
+        """
+        transition_beats = set()
+        for beat_id, beat in self._script_beats.items():
+            if beat.gender_transition:
+                transition_beats.add(beat_id)
+                logger.info(f"状态转换 beat: {beat_id} -> {beat.gender_transition}")
+
+        if not transition_beats:
+            return
+
+        transition_keywords = [
+            "变装", "换装", "变身", "男装褪去", "露出女装", "穿上男装",
+            "女装", "男装", "长裙", "长袍", "飞翔", "跃起", "变身",
+        ]
+
+        boosted = []
+        for shot in shots:
+            anchor = shot.script_anchor or {}
+            beat_id = anchor.get("beat", "UNMATCHED")
+            if beat_id not in transition_beats:
+                continue
+
+            # 镜头描述文本
+            desc = " ".join(filter(None, [
+                shot.action or "",
+                shot.action_details or "",
+                shot.asr_text or "",
+                shot.dialogue or "",
+                ", ".join(shot.key_objects or []),
+            ]))
+
+            # 至少命中 2 个转换关键词，或明确包含"女装""男装"之一
+            matched = [k for k in transition_keywords if k in desc]
+            has_explicit_gender = "女装" in desc or "男装" in desc or "长裙" in desc
+            if len(matched) >= 2 or has_explicit_gender:
+                shot.status = "核心"
+                shot.dedup_reason = f"状态转换 beat {beat_id} 关键镜头"
+                shot.quality_score = max(shot.quality_score, 6.0)
+                boosted.append(shot.shot_id)
+
+        if boosted:
+            logger.info(f"提升为状态转换核心镜头: {boosted}")
 
     def _initial_state_mark(self, shots: List[Shot]):
         """基于素材状态做初始标记"""

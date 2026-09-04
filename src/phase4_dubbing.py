@@ -197,13 +197,18 @@ class Phase4Dubbing:
 
             clip_path = d.get("clip_path") or d.get("source_clip") or d.get("video_path") or ""
             if not clip_path and shot:
-                split_path = None
-                if shot.cv_metadata:
-                    split_path = shot.cv_metadata.get("shot_config", {}).get("split_clip_path")
-                clip_path = split_path or shot.source_path
-                if split_path and not os.path.exists(split_path):
-                    logger.warning(f"[Phase4] 切分片段不存在，回退到原始素材: {shot.shot_id}")
-                    clip_path = shot.source_path
+                # timeline 时间码基于原始素材，优先使用原始素材路径直接截取
+                clip_path = shot.source_path
+                if not os.path.exists(clip_path):
+                    # 回退到 phase1_split_clips，此时时间码已失效，只能取整段
+                    split_path = None
+                    if shot.cv_metadata:
+                        split_path = shot.cv_metadata.get("shot_config", {}).get("split_clip_path")
+                    if split_path and os.path.exists(split_path):
+                        logger.warning(f"[Phase4] 原始素材不存在，回退到切分片段: {shot.shot_id}")
+                        clip_path = split_path
+                    else:
+                        logger.error(f"[Phase4] 原始素材和切分片段都不存在，跳过: {shot.shot_id}")
 
             fps = getattr(shot, "fps", 24.0) if shot else 24.0
             tc_in = d.get("tc_in") or (shot.tc_in if shot else "00:00:00:00")

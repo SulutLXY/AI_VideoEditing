@@ -52,6 +52,8 @@ class Phase1AnalysisProcessor:
         cv_meta: Optional[Dict[str, Any]] = None,
         source_file: Optional[str] = None,
         source_path: Optional[str] = None,
+        tc_in: Optional[str] = None,
+        tc_out: Optional[str] = None,
     ) -> List[Shot]:
         """分析单个视频片段，返回完整 Shot
 
@@ -116,13 +118,17 @@ class Phase1AnalysisProcessor:
         if shot_id is None:
             shot_id = next_shot_id_func()
 
+        # 优先使用传入的原始素材时间码；未传入则按当前片段默认 0~duration
+        original_tc_in = tc_in if tc_in is not None else sec_to_tc(0.0, fps)
+        original_tc_out = tc_out if tc_out is not None else sec_to_tc(duration, fps)
+
         shot = Shot(
             shot_id=shot_id,
             state=state,
             source_file=source_file,
             source_path=source_path,
-            tc_in=sec_to_tc(0.0, fps),
-            tc_out=sec_to_tc(duration, fps),
+            tc_in=original_tc_in,
+            tc_out=original_tc_out,
             duration_sec=duration,
             fps=fps,
             resolution=cv_meta.get("resolution", (1920, 1080)),
