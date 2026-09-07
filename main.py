@@ -24,6 +24,7 @@ if sys.platform == "win32":
 import argparse
 import json
 import shutil
+import subprocess
 import time
 import yaml
 
@@ -320,9 +321,19 @@ def main():
     run_phase = args.phase
 
     if not run_all and run_phase is None:
-        print("错误: 请指定 --all 或 --phase")
-        parser.print_help()
-        sys.exit(1)
+        # 双击 main.py（无参数）的默认行为：启动 Web UI 前后端一体服务。
+        # launcher 会先释放已占用的端口，实现"双击即重启"。
+        print("未指定 --all / --phase，自动启动 Web UI（双击 main.py 默认行为）...")
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        launcher = os.path.join(project_root, "launcher.py")
+        venv_python = os.path.join(project_root, ".venv311", "Scripts", "python.exe")
+        py = venv_python if os.path.exists(venv_python) else sys.executable
+        try:
+            ret = subprocess.run([py, launcher, "--port", "7860"], cwd=project_root).returncode
+            sys.exit(ret)
+        except KeyboardInterrupt:
+            print("\n已退出")
+            sys.exit(0)
 
     phases_to_run = [0, 1, 2, 3, 4] if run_all else [run_phase]
 
@@ -578,19 +589,29 @@ def main():
             if decisions is None:
                 # 优先从 timeline.json 读取（含 passed 终审结果）
                 _, EditDecision = _import_phase3_editor()
+
+                def _load_decision(d: dict) -> 'EditDecision':
+                    """从 JSON dict 构造 EditDecision，兼容 Phase4Exporter 的 source_in/source_out 格式"""
+                    fields = set(EditDecision.__dataclass_fields__.keys())
+                    kwargs = {k: v for k, v in d.items() if k in fields}
+                    # timeline.json（Phase4Exporter 导出）用 source_in/source_out，需映射到 tc_in/tc_out
+                    kwargs.setdefault('tc_in', d.get('source_in', '00:00:00:00'))
+                    kwargs.setdefault('tc_out', d.get('source_out', '00:00:00:00'))
+                    return EditDecision(**kwargs)
+
                 phase3_path = args.input_json or os.path.join(output_dir, 'timeline.json')
                 fallback_phase3_path = os.path.join(output_dir, 'phase3_edit_decision.json')
 
                 if os.path.exists(phase3_path):
                     with open(phase3_path, 'r', encoding='utf-8') as f:
                         timeline_data = json.load(f)
-                    decisions = [EditDecision(**d) for d in timeline_data.get('timeline', [])]
+                    decisions = [_load_decision(d) for d in timeline_data.get('timeline', [])]
                     passed = timeline_data.get('passed', False)
                     total_score = timeline_data.get('total_score', 0.0)
                     logger.info(f"从 timeline.json 加载 {len(decisions)} 个剪辑决策")
                 elif os.path.exists(fallback_phase3_path):
                     with open(fallback_phase3_path, 'r', encoding='utf-8') as f:
-                        decisions = [EditDecision(**d) for d in json.load(f).get('timeline', [])]
+                        decisions = [_load_decision(d) for d in json.load(f).get('timeline', [])]
                     passed = False
                     total_score = 0.0
                     logger.info(f"从 phase3_edit_decision.json 加载 {len(decisions)} 个剪辑决策")

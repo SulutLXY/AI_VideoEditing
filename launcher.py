@@ -85,6 +85,44 @@ class Launcher:
             self.log(f"依赖安装失败: {e}")
             sys.exit(1)
 
+    def kill_process_on_port(self, port: int) -> bool:
+        """释放指定端口：结束占用该端口的进程，实现双击重启。
+
+        Windows 下通过 netstat 找到 LISTENING 状态的 PID 再 taskkill；
+        其他平台暂不支持，返回 False 表示未做任何处理。
+        """
+        if self.system != "Windows":
+            return False
+        try:
+            result = subprocess.run(
+                ["netstat", "-ano"],
+                capture_output=True, text=True, check=False
+            )
+            pids = set()
+            for line in result.stdout.splitlines():
+                if f":{port}" not in line:
+                    continue
+                if "LISTENING" not in line.upper():
+                    continue
+                parts = line.split()
+                if parts and parts[-1].isdigit():
+                    pids.add(parts[-1])
+            killed = False
+            for pid in pids:
+                r = subprocess.run(
+                    ["taskkill", "/F", "/PID", pid],
+                    capture_output=True, check=False
+                )
+                if r.returncode == 0:
+                    self.log(f"已结束占用端口 {port} 的旧进程 (PID {pid})")
+                    killed = True
+                else:
+                    self.log(f"结束 PID {pid} 失败: {r.stderr.decode(errors='ignore').strip()}")
+            return killed
+        except Exception as e:
+            self.log(f"释放端口 {port} 时出错: {e}")
+            return False
+
     def start_webui(self):
         """启动 webui.py 服务"""
         cmd = [sys.executable, str(WEBUI), "--port", str(self.port)]
@@ -139,6 +177,10 @@ class Launcher:
 
         if not self.check_dependencies():
             self.install_dependencies()
+
+        # 先释放端口，再启动，实现双击即重启
+        self.kill_process_on_port(self.port)
+        time.sleep(1)
 
         self.start_webui()
 

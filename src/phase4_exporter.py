@@ -143,9 +143,9 @@ class Phase4Exporter:
         name = ''.join(c for c in name if c.isalnum()).upper()
         return name[:8]
 
-    def _parse_speed(self, speed_str: str) -> float:
-        """解析速度字符串为倍率"""
-        speed_str = speed_str.strip().lower()
+    def _parse_speed(self, speed_str) -> float:
+        """解析速度字符串为倍率（兼容 float / '0.75x' / '75%' 等格式）"""
+        speed_str = str(speed_str).strip().lower()
         if speed_str == '1x' or speed_str == '100%':
             return 1.0
         if '%' in speed_str:

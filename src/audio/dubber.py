@@ -37,7 +37,8 @@ class Dubber:
     def mix_audio(self, voice_files: List[str],
                   bgm_file: Optional[str] = None,
                   output_path: str = "output/mixed_audio.wav",
-                  voice_timing: Optional[List[Tuple[float, float]]] = None) -> str:
+                  voice_timing: Optional[List[Tuple[float, float]]] = None,
+                  target_duration: Optional[float] = None) -> str:
         """
         混合语音和BGM（使用 FFmpeg）
 
@@ -46,12 +47,14 @@ class Dubber:
             bgm_file: BGM文件路径
             output_path: 输出路径
             voice_timing: 每段语音的开始时间 [(start_sec, end_sec), ...]
+            target_duration: 成片目标时长（秒）。音频不足时自动用静音补齐，
+                             避免 dub_video 的 -shortest 把视频截短。
 
         Returns:
             输出文件路径
         """
         # 先按时间线合并语音为一个文件
-        voice_merged = self._merge_voice_files(voice_files, voice_timing)
+        voice_merged = self._merge_voice_files(voice_files, voice_timing, target_duration)
 
         if bgm_file and Path(bgm_file).exists():
             self._mix_with_ffmpeg(voice_merged, bgm_file, output_path)
@@ -63,25 +66,25 @@ class Dubber:
         if Path(voice_merged).exists() and voice_merged != output_path:
             os.remove(voice_merged)
 
-        logger.info(f"[Dubber] 音频合成完成: {output_path}")
+        # 对齐成片时长：不足时用静音补齐（关键修复，防止 -shortest 截断视频）
+        if target_duration:
+            self._pad_audio_inplace(output_path, target_duration)
+
+        logger.info(f"[Dubber] 音频合成完成: {output_path} (目标 {target_duration:.1f}s)")
         return output_path
 
     def _merge_voice_files(self, voice_files: List[str],
-                           timing: Optional[List[Tuple[float, float]]] = None) -> str:
+                           timing: Optional[List[Tuple[float, float]]] = None,
+                           target_duration: Optional[float] = None) -> str:
         """合并语音文件（FFmpeg concat 或按时间线 pad）"""
         if not voice_files:
             silent = str(self.temp_dir / "silent.wav")
-            subprocess.run([
-                "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
-                "-t", "1", "-acodec", "pcm_s16le", silent
-            ], capture_output=True)
+            duration = target_duration if target_duration and target_duration > 0 else 1.0
+            self._generate_silent_wav(silent, duration)
             return silent
 
-        # 单段直接返回
-        if len(voice_files) == 1:
-            return voice_files[0]
-
-        # 如果提供了时间线，使用 adelay + amix 拼接（保留空白间隔）
+        # 如果提供了时间线，使用 adelay + amix 拼接（保留空白间隔，含单段语音）
+        # 注意：不要对单段语音提前 return，否则会跳过时间定位，导致对白从 0s 开始
         if timing and len(timing) == len(voice_files):
             return self._merge_with_timing(voice_files, timing)
 
@@ -113,10 +116,17 @@ class Dubber:
 
         mix_inputs = "".join(f"[a{i}]" for i in range(len(voice_files)))
         total_end = max(t[1] for t in timing)
-        filters.append(f"{mix_inputs}amix=inputs={len(voice_files)}:duration=longest:dropout_transition=2[aout]")
+        # amix duration=longest 只保留到最长输入，最后用 apad 补齐到整条时间线结束
+        filters.append(f"{mix_inputs}amix=inputs={len(voice_files)}:duration=longest:dropout_transition=2,apad=whole_dur={total_end}[aout]")
 
         output = str(self.temp_dir / "timed_voice.wav")
-        cmd = ["ffmpeg", "-y"] + inputs + ["-filter_complex", ";".join(filters), "-map", "[aout]", output]
+        cmd = ["ffmpeg", "-y"] + inputs + [
+            "-filter_complex", ";".join(filters),
+            "-map", "[aout]",
+            "-t", str(total_end),
+            "-acodec", "pcm_s16le", "-ar", "24000", "-ac", "1",
+            output,
+        ]
         subprocess.run(cmd, capture_output=True, check=False)
 
         if not Path(output).exists() or self._get_audio_duration(output) < total_end * 0.5:
@@ -125,6 +135,27 @@ class Dubber:
             return self._merge_voice_files(voice_files, None)
 
         return output
+
+    def _pad_audio_inplace(self, audio_path: str, target_duration: float):
+        """把音频文件用静音补齐到目标时长（不足才补，超过不动），直接覆盖原文件"""
+        if not target_duration or target_duration <= 0:
+            return
+        current = self._get_audio_duration(audio_path)
+        if current >= target_duration:
+            return
+        padded = str(self.temp_dir / "padded_audio.wav")
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-i", audio_path,
+            "-af", f"apad=whole_dur={target_duration}",
+            "-t", str(target_duration),
+            "-acodec", "pcm_s16le", "-ar", "24000", "-ac", "1",
+            padded
+        ], capture_output=True, check=False)
+        if Path(padded).exists():
+            import shutil
+            shutil.move(padded, audio_path)
+            logger.info(f"[Dubber] 音频已补齐: {current:.2f}s -> {target_duration:.2f}s")
 
     def _mix_with_ffmpeg(self, voice_file: str, bgm_file: str, output_path: str):
         """使用 FFmpeg 混合语音和BGM"""
@@ -262,6 +293,16 @@ class Dubber:
                     "-shortest",
                     str(output_path)
                 ], capture_output=True, check=False)
+
+            # 校验输出时长：音频补齐后，-shortest 不应再截短视频；
+            # 若仍明显短于源视频，说明音频侧仍有缺失，需要排查
+            out_dur = self._get_audio_duration(str(output_path))
+            src_dur = self._get_audio_duration(str(video_path))
+            if src_dur > 0 and out_dur < src_dur * 0.9:
+                logger.error(
+                    f"[Dubber] 成片时长异常: {out_dur:.2f}s，源视频 {src_dur:.2f}s，"
+                    f"疑似音频被截断，请检查 mixed_audio 时长"
+                )
 
             logger.info(f"[Dubber] 视频合成完成: {output_path}")
             return str(output_path)
@@ -478,9 +519,9 @@ class Dubber:
                 if bgm:
                     bgm_file = str(bgm)
 
-        # Step 3: 混合音频
+        # Step 3: 混合音频（按成片总时长补齐，防止 -shortest 截断视频）
         mixed_audio = str(output_dir / "mixed_audio.wav")
-        self.mix_audio(voice_files, bgm_file, mixed_audio, voice_timing)
+        self.mix_audio(voice_files, bgm_file, mixed_audio, voice_timing, target_duration=total_duration)
 
         # Step 4: 合并视频片段（先 concat 成一个完整视频）
         final_video_path = str(output_dir / "final_with_dubbing.mp4")
