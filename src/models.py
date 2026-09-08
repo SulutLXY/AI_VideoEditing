@@ -135,6 +135,8 @@ class ScriptBeat:
     emotion_intensity: float = 0.0           # 情绪强度 0-5
     priority: int = 3                        # 剧情重要性 1-5，5 最高
     required_shots_count: int = 1            # 建议最少镜头数
+    # 用户在台本中以「- 标记：锁定」指定的节点：重分析时不可合并/省略/改写
+    locked: bool = False
     # 由 dialogue_planner 生成，驱动后续配音
     dialogue_entries: List[DialogueEntry] = field(default_factory=list)
     # 由 Phase 2 生成：每个 beat 拆解后的 sub-beat / 分镜点列表
@@ -167,6 +169,7 @@ class ScriptBeat:
             emotion_intensity=float(data.get("emotion_intensity", 0.0) or 0.0),
             priority=int(data.get("priority", 3) or 3),
             required_shots_count=int(data.get("required_shots_count", 1) or 1),
+            locked=bool(data.get("locked", False)),
         )
         beat.dialogue_entries = [
             DialogueEntry.from_dict(e) for e in (data.get("dialogue_entries") or [])

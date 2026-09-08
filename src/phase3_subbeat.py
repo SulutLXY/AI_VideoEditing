@@ -80,6 +80,27 @@ class SubBeatSplitter:
         key_dialogue = beat.get("key_dialogue", "")
         dialogue_entries = list(beat.get("dialogue_entries", []) or [])
 
+        # 锁定的 beat 不再拆分：用户指定的节点（含一键分镜头插入的）保持完整
+        if beat.get("locked"):
+            return [SubBeat(
+                sub_beat_id=f"{beat_id}-1",
+                parent_beat_id=beat_id,
+                act=act,
+                scene=scene,
+                content=content,
+                key_actions=key_actions,
+                key_dialogue=key_dialogue,
+                emotion=emotion,
+                pace=pace,
+                gender_state=gender_state,
+                gender_transition=gender_transition,
+                estimated_duration=beat_duration,
+                start_in_parent=0.0,
+                end_in_parent=beat_duration,
+                priority=priority,
+                dialogue_entries=dialogue_entries,
+            )]
+
         sub_beats: List[SubBeat] = []
         cursor = 0.0
 

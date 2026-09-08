@@ -425,12 +425,23 @@ def main():
                 for beat in script_beats:
                     logger.info(f"  - {beat.act} / {beat.beat_id}: {beat.content[:40]}...")
 
-            # 用 LLM 分析剧本节奏，为每个 beat 分配目标时长
+            # 用 LLM 分析剧本节奏，为每个 beat 分配目标时长；
+            # 台本中含「锁定/分节点」标记时，改为基于当前台本重新生成节点结构
             beat_analysis = {}
             try:
                 llm_service = LLMService(config)
                 target_duration = parse_duration_string(config['project'].get('target_duration', 0))
-                beat_analysis = llm_service.analyze_script_beats(script_beats, target_duration)
+                if target_duration > 0 and any(b.locked for b in script_beats):
+                    logger.info("检测到台本中的锁定/分节点标记，基于当前台本重新生成情节点…")
+                    rebuilt = llm_service.rebuild_beats(script_beats, target_duration)
+                    if rebuilt:
+                        script_beats = [ScriptBeat.from_dict(b) for b in rebuilt]
+                        logger.info(f"情节点重建完成: {len(script_beats)} 个节点")
+                    else:
+                        logger.warning("情节点重建失败或锁定节点缺失，回退为仅时长富化")
+                        beat_analysis = llm_service.analyze_script_beats(script_beats, target_duration)
+                else:
+                    beat_analysis = llm_service.analyze_script_beats(script_beats, target_duration)
                 if beat_analysis:
                     for beat in script_beats:
                         info = beat_analysis.get(beat.beat_id)
@@ -444,12 +455,12 @@ def main():
                             beat.gender_transition = info.get("gender_transition", beat.gender_transition or "")
                             if info.get("key_actions"):
                                 beat.key_actions = info.get("key_actions")
-                    # 解析对白，生成 voice_cast 和 dialogue_entries
-                    try:
-                        planner = DialoguePlanner(config)
-                        script_beats, _ = planner.plan(script_beats)
-                    except Exception as e:
-                        logger.warning(f"对白规划失败，将使用原始 key_dialogue: {e}")
+                # 解析对白，生成 voice_cast 和 dialogue_entries（重建/富化后都执行）
+                try:
+                    planner = DialoguePlanner(config)
+                    script_beats, _ = planner.plan(script_beats)
+                except Exception as e:
+                    logger.warning(f"对白规划失败，将使用原始 key_dialogue: {e}")
             except Exception as e:
                 logger.warning(f"剧本节奏分析失败，将使用平均时长分配: {e}")
 

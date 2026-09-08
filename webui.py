@@ -1,46 +1,52 @@
 # -*- coding: utf-8 -*-
 """
-LLM-AutoCut Web UI
+LLM-AutoCut Web UI —— 流程式交互界面
 
-基于 Gradio 的快速原型界面，用于：
-- 编辑配置、上传素材、编写剧本大纲
-- 分阶段运行 pipeline
-- 查看日志和输出结果
-- 下载生成的 EDL / FCPXML / CSV / JSON
+布局：
+- 左侧步骤导航（①准备 ②剧本分析 ③镜头筛选 ④剪辑导出），项目是一个整体，步骤只是视角切换
+- 顶栏小按钮：配置（弹窗）、API Key（弹窗）、日志（浮窗，点开全屏展开）
+- 内容区顶部：细进度条（运行时显示）；每个步骤面板顶部有独立的运行按钮
+- 右侧资源弹窗：Phase 0/1 产物（只收录 Phase 1 分析过的资源）
 
-启动方式:
-    python webui.py
+运行模型：
+- 每个步骤独立运行（subprocess 调 main.py --phase N）
+- 任一运行期间所有运行按钮置灰，完成后恢复并实时刷新各步骤数据
+- 运行日志写入内存环形缓冲，浮窗显示摘要，弹窗显示全文
 
-可选参数:
-    python webui.py --config config/config.yaml --port 7860
+启动：
+    python webui.py [--config config.yaml] [--port 7860] [--share]
 """
 import argparse
 import json
 import os
+import queue
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
+from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 WORKSPACE_DIR = PROJECT_ROOT / "workspace"
 
-# 确保项目根目录在路径中
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import gradio as gr
+import pandas as pd
 import yaml
 
-from src.utils import load_config, parse_script_outline, logger, ensure_dir, fallback_vlm_to_local
+from src.utils import load_config, logger, ensure_dir, fallback_vlm_to_local
 from src.phase2_anchor_editor import export_anchor_corrections, apply_anchor_corrections
 
-import pandas as pd
 
+# ----------------------------------------------------------------------
+# 常量与会话状态
+# ----------------------------------------------------------------------
 
-# 默认配置模板
 DEFAULT_CONFIG = """project:
   name: "短片项目_雨夜告白"
   target_duration: "5m"
@@ -59,15 +65,6 @@ materials:
     state: "RAW"
     split: true
     analyze: true
-  - path: "./materials/processed/"
-    state: "PROCESSED"
-    split: false
-    analyze: true
-  - path: "./materials/analyzed/"
-    state: "ANALYZED"
-    split: false
-    analyze: false
-    meta_format: "autocut_v1"
 
 split_scoring:
   weights:
@@ -95,53 +92,49 @@ quality_scoring:
     metadata_complete: 0.10
 
 phase2:
-  # Phase 2 独立运行时可直接指定素材库目录做 CV 轻量清点
   materials_dir: ""
   allow_cv_inventory: true
 
 script_preprocessing:
   enabled: true
-  provider: "deepseek"
+  provider: deepseek
   max_chunk_chars: 4000
   output_shot_requirements: true
 
 models:
   vlm:
-    # 豆包示例：provider="doubao", model="doubao-seed-2-0-pro-260215"
-    # base_url: "https://ark.cn-beijing.volces.com/api/v3"
-    provider: "doubao"
-    model: "doubao-seed-2-0-pro-260215"
+    provider: doubao
+    model: doubao-seed-2-0-pro-260215
     api_key: ""
-    base_url: "https://ark.cn-beijing.volces.com/api/v3"
+    base_url: https://ark.cn-beijing.volces.com/api/v3
     max_tokens: 4096
     temperature: 0.3
     frame_sample_rate: 5
     max_frames: 150
   video_vlm:
-    provider: "vlm_fallback"
-    model: "doubao-seed-2-0-pro-260215"
+    provider: vlm_fallback
+    model: doubao-seed-2-0-pro-260215
     max_tokens: 4096
     temperature: 0.3
     frame_sample_rate: 5
     max_frames: 150
   llm:
-    # 豆包文本模型示例：model="doubao-pro-32k"
-    provider: "deepseek"
-    model: "deepseek-chat"
+    provider: deepseek
+    model: deepseek-chat
     api_key: ""
-    base_url: "https://api.deepseek.com"
+    base_url: https://api.deepseek.com
     max_tokens: 8192
     temperature: 0.5
   asr:
-    provider: "whisper"
-    model: "large-v3"
-    device: "cpu"
-    language: "zh"
+    provider: whisper
+    model: large-v3
+    device: cpu
+    language: zh
 
 processing:
   scene_threshold: 0.3
   min_shot_duration: 1.0
-  keyframe_strategy: "adaptive"
+  keyframe_strategy: adaptive
   keyframe_interval: 2
   keyframe_per_shot: 3
   enable_l1_hash: true
@@ -160,36 +153,75 @@ character_refs:
   auto_detect: true
 """
 
-DEFAULT_SCRIPT = """# 雨夜告白
+DEFAULT_SCRIPT = """# 剧本大纲
 
-## 第一幕：等待
+## 未分幕
+
 ### 场1-情节点A
-- 地点：咖啡馆内
-- 时间：傍晚
-- 内容：男主独自等待，表现焦虑，反复看表
-- 情绪：焦虑、压抑
-- 关键动作：看表、深呼吸、望向门口
-- 关键台词：""
-
-### 场1-情节点B
-- 地点：咖啡馆门口
-- 时间：雨夜
-- 内容：女主推门而入，两人对视
-- 情绪：紧张 → 期待
-- 关键动作：推门、对视、停顿
+- 地点：
+- 时间：
+- 内容：
+- 情绪：
+- 关键动作：
 - 关键台词：""
 """
 
+# Phase 1 资源库默认路径（当前项目已生成的分析产物，后续再调整此逻辑）
+RESOURCE_ANALYSIS_PATH = "output/phase1_analysis.json"
+RESOURCE_SPLIT_CLIPS_DIR = "output/phase1_split_clips"
+RESOURCE_ROUGH_CLIPS_DIR = "output/phase0_rough_clips"
+
 
 class SessionState:
-    """简单的会话状态管理"""
+    """会话状态：路径、API Key、运行锁、日志缓冲"""
+
     def __init__(self):
-        # 默认指向项目内 workspace，避免页面刷新后 SESSION 丢失导致面板无法加载已有产物
         self.work_dir = str(WORKSPACE_DIR)
         self.output_dir = os.path.join(self.work_dir, "output")
+        self.vlm_key = ""
+        self.llm_key = ""
+        # 运行状态（模块级单用户够用）
+        self.running = False
+        self.run_step = ""           # 当前运行阶段标签，如 "2"
+        self.run_label = ""          # 进度条文字
+        self.run_done = False        # 完成标志，由 Timer 消费
+        self.run_ok = False
+        self.log = deque(maxlen=800)
+        self.suggest_view = ""       # 运行完成后建议切换的视图（如 "review"）
+        self.force_edit_view = False
+        # 各步骤状态栏文字（tick 定时刷新读取，点击事件写入）
+        self.status_msgs = {"prep": "", "script": "", "match": "", "export": ""}
+
+    def reset_run(self):
+        self.running = False
+        self.run_step = ""
+        self.run_label = ""
+        self.run_done = False
+        self.run_ok = False
+        self.suggest_view = ""
+        self.force_edit_view = False
 
 
 SESSION = SessionState()
+
+
+# ----------------------------------------------------------------------
+# 基础工具
+# ----------------------------------------------------------------------
+
+def _workspace_path(*parts: str) -> str:
+    return os.path.join(SESSION.work_dir, *parts)
+
+
+def _output_path(name: str) -> str:
+    return os.path.join(SESSION.output_dir, name)
+
+
+def _read_text(path: str) -> str:
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    return ""
 
 
 def _copy_files_to_dir(files, directory):
@@ -216,175 +248,32 @@ def _clear_dir_if_has_upload(files, directory):
                 os.remove(old_path)
 
 
-def _ensure_structured_script(
-    script_text: str,
-    script_path: str,
-    config: dict,
-) -> Tuple[str, str]:
-    """确保 script_text 是结构化剧本大纲；如果不是，自动调用 LLM 预处理。
+def _split_comma(text: Any) -> List[str]:
+    if pd.isna(text) or text is None:
+        return []
+    return [s.strip() for s in str(text).split(",") if s.strip()]
 
-    返回: (处理后的剧本文本, 状态信息)
-    """
-    from src.services.script_service import (
-        is_structured_outline,
-        ScriptPreprocessor,
-        ScriptParseError,
-    )
-    from src.services.llm_service import LLMService
-    from src.utils import parse_script_outline
 
-    if is_structured_outline(script_text):
-        return script_text, "剧本已是结构化大纲，无需预处理"
+def _fmt_size(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 ** 2:
+        return f"{n / 1024:.1f} KB"
+    if n < 1024 ** 3:
+        return f"{n / 1024 ** 2:.1f} MB"
+    return f"{n / 1024 ** 3:.1f} GB"
 
-    # 非结构化剧本，尝试自动预处理
-    llm_config = config.get("models", {}).get("llm", {})
-    if not llm_config.get("api_key"):
-        return (
-            script_text,
-            "警告：当前剧本不是结构化大纲，且未配置 LLM API Key，无法自动解析。"
-            "请先点击「自动解析为台本」，或手动编辑为标准 Markdown 大纲后再运行。",
-        )
 
+def _human_time(ts: float) -> str:
     try:
-        llm_service = LLMService(config)
-        preprocessor_config = config.get("script_preprocessing", {})
-        preprocessor = ScriptPreprocessor(llm_service, preprocessor_config)
-        parsed = preprocessor.preprocess(script_text)
-
-        # 二次校验
-        import tempfile
-
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".md", dir=os.path.dirname(script_path))
-        try:
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-                f.write(parsed)
-            beats = parse_script_outline(tmp_path)
-        finally:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-
-        if not beats:
-            return (
-                script_text,
-                "警告：剧本自动解析失败，模型返回的结构化文本未能提取出任何情节点。"
-                "请先点击「自动解析为台本」检查模型输出，或手动编辑为标准 Markdown 大纲后再运行。",
-            )
-
-        return (
-            parsed,
-            f"剧本已自动解析为结构化大纲（共 {len(beats)} 个情节点），可直接运行 Pipeline。",
-        )
-    except ScriptParseError as e:
-        return (
-            script_text,
-            f"警告：剧本自动解析失败: {e} 请先点击「自动解析为台本」重试，或手动编辑为标准 Markdown 大纲。",
-        )
-    except Exception as e:
-        return (
-            script_text,
-            f"警告：剧本自动解析时发生异常: {e} 请先点击「自动解析为台本」重试，或手动编辑为标准 Markdown 大纲。",
-        )
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    except Exception:
+        return "-"
 
 
-def prepare_workspace(
-    config_text: str,
-    script_text: str,
-    raw_files: list,
-    processed_files: list,
-    analyzed_videos: list,
-    analyzed_metas: list,
-    materials_dir: str = "",
-    vlm_key: str = "",
-    llm_key: str = "",
-    clear_output: bool = True,
-) -> str:
-    """准备项目内工作目录，写入配置、剧本和素材，可选注入 API Key"""
-    try:
-        # 解析配置，确保基本结构正确
-        config = yaml.safe_load(config_text)
-        if not config:
-            return "错误：配置为空或无法解析"
-
-        # 如果用户填写了 API Key，注入到配置中（优先于环境变量）
-        if vlm_key and vlm_key.strip():
-            config.setdefault("models", {}).setdefault("vlm", {})["api_key"] = vlm_key.strip()
-        if llm_key and llm_key.strip():
-            config.setdefault("models", {}).setdefault("llm", {})["api_key"] = llm_key.strip()
-
-        # 使用项目内 workspace 目录，避免存入系统临时目录
-        SESSION.work_dir = str(WORKSPACE_DIR)
-        SESSION.output_dir = os.path.join(SESSION.work_dir, "output")
-        ensure_dir(SESSION.work_dir)
-        ensure_dir(SESSION.output_dir)
-
-        # 仅完整工作流（--all）时默认清空整个输出目录；单阶段运行保留其它阶段结果
-        if clear_output and os.path.exists(SESSION.output_dir):
-            shutil.rmtree(SESSION.output_dir, ignore_errors=True)
-        ensure_dir(SESSION.output_dir)
-
-        # 写入配置（先写一版，用于后续路径更新后再覆盖）
-        config_path = os.path.join(SESSION.work_dir, "config.yaml")
-
-        # 写入剧本：先尝试自动解析为结构化大纲
-        script_path = os.path.join(SESSION.work_dir, "script.md")
-        structured_script, script_status = _ensure_structured_script(script_text, script_path, config)
-        with open(script_path, "w", encoding="utf-8") as f:
-            f.write(structured_script)
-
-        # 创建三种素材子目录
-        raw_dir = os.path.join(SESSION.work_dir, "materials", "raw")
-        processed_dir = os.path.join(SESSION.work_dir, "materials", "processed")
-        analyzed_dir = os.path.join(SESSION.work_dir, "materials", "analyzed")
-
-        # 仅对本次有上传的目录做清空，保留未上传状态的旧素材
-        _clear_dir_if_has_upload(raw_files, raw_dir)
-        _clear_dir_if_has_upload(processed_files, processed_dir)
-        _clear_dir_if_has_upload(analyzed_videos, analyzed_dir)
-        # analyzed_metas 也和视频一起放在 analyzed_dir，随视频目录清空即可
-
-        uploaded = []
-        uploaded.extend([f"[RAW] {n}" for n in _copy_files_to_dir(raw_files, raw_dir)])
-        uploaded.extend([f"[PROCESSED] {n}" for n in _copy_files_to_dir(processed_files, processed_dir)])
-        uploaded.extend([f"[ANALYZED] {n}" for n in _copy_files_to_dir(analyzed_videos, analyzed_dir)])
-        uploaded.extend([f"[ANALYZED_META] {n}" for n in _copy_files_to_dir(analyzed_metas, analyzed_dir)])
-
-        # 更新配置中的路径为绝对路径
-        config["paths"]["raw_materials"] = raw_dir
-        config["paths"]["output"] = SESSION.output_dir
-        config["paths"]["temp"] = os.path.join(SESSION.work_dir, "temp")
-        config["paths"]["script_outline"] = script_path
-        config["paths"]["reference_images"] = os.path.join(SESSION.work_dir, "refs")
-        # 确保 materials 配置指向工作目录
-        for item in config.get("materials", []):
-            if item.get("state") == "RAW":
-                item["path"] = raw_dir
-            elif item.get("state") == "PROCESSED":
-                item["path"] = processed_dir
-            elif item.get("state") == "ANALYZED":
-                item["path"] = analyzed_dir
-
-        # 若用户指定了素材库目录，写入 Phase 2 配置并覆盖 raw_materials 路径
-        if materials_dir and materials_dir.strip():
-            materials_dir_abs = os.path.abspath(materials_dir.strip())
-            config.setdefault("phase2", {})["materials_dir"] = materials_dir_abs
-            config["paths"]["raw_materials"] = materials_dir_abs
-
-        with open(config_path, "w", encoding="utf-8") as f:
-            yaml.dump(config, f, allow_unicode=True, sort_keys=False)
-
-        return (
-            f"工作目录已准备: {SESSION.work_dir}\n"
-            f"配置: {config_path}\n"
-            f"剧本: {script_path}\n"
-            f"剧本状态: {script_status}\n"
-            f"已上传素材: {uploaded or '无'}\n"
-            f"输出目录: {SESSION.output_dir}"
-        )
-    except Exception as e:
-        return f"准备工作区失败: {e}\n{traceback.format_exc()}"
-
+# ----------------------------------------------------------------------
+# 剧本导入与预处理（沿用已验证逻辑）
+# ----------------------------------------------------------------------
 
 def on_script_upload(file_path):
     """上传剧本文档后读取内容并回填编辑器"""
@@ -406,65 +295,65 @@ def on_script_upload(file_path):
         return gr.update(), f"导入失败: {e}\n{traceback.format_exc()}"
 
 
-def preprocess_script(
-    config_text: str,
-    script_text: str,
-    uploaded_file_path,
-    vlm_key: str = "",
-    llm_key: str = "",
-):
-    """调用 LLM 把原始剧本解析为结构化台本。
+def preprocess_script(script_text: str, uploaded_file_path, config_text: str = ""):
+    """调用 LLM 把原始剧本解析为结构化台本（导入剧本按钮）。
 
-    优先解析用户上传的文件；若未上传文件，则解析右侧编辑器中的文本。
+    优先解析用户上传的文件；若未上传文件，则解析编辑器中的文本。
     """
-    from src.services.script_service import ScriptPreprocessor, is_structured_outline, read_script_file, ScriptReadError, ScriptParseError
+    from src.services.script_service import (
+        ScriptPreprocessor, is_structured_outline, read_script_file,
+        ScriptReadError, ScriptParseError,
+    )
     from src.services.llm_service import LLMService
     from src.utils import parse_script_outline
 
-    # 确保工作区存在，用于保存 script.md
-    work_dir = str(WORKSPACE_DIR)
+    work_dir = SESSION.work_dir
     ensure_dir(work_dir)
     script_path = os.path.join(work_dir, "script.md")
 
-    # 优先读取上传的文件
+    # 编辑器即事实源：优先解析编辑器内容；仅当编辑器为空时才回退上传文件
     source_label = "编辑器内容"
     text_to_parse = script_text
-    if uploaded_file_path:
-        if isinstance(uploaded_file_path, list):
-            uploaded_file_path = uploaded_file_path[0] if uploaded_file_path else None
-        if isinstance(uploaded_file_path, str) and os.path.exists(uploaded_file_path):
-            try:
-                text_to_parse = read_script_file(uploaded_file_path)
-                source_label = os.path.basename(uploaded_file_path)
-            except ScriptReadError as e:
-                return script_text, f"读取上传文件失败: {e}"
-        else:
-            return script_text, "上传文件路径无效"
+    if not text_to_parse or not text_to_parse.strip():
+        if uploaded_file_path:
+            if isinstance(uploaded_file_path, list):
+                uploaded_file_path = uploaded_file_path[0] if uploaded_file_path else None
+            if isinstance(uploaded_file_path, str) and os.path.exists(uploaded_file_path):
+                try:
+                    text_to_parse = read_script_file(uploaded_file_path)
+                    source_label = os.path.basename(uploaded_file_path)
+                except ScriptReadError as e:
+                    return script_text, f"读取上传文件失败: {e}"
+            else:
+                return script_text, "上传文件路径无效"
 
     if not text_to_parse or not text_to_parse.strip():
         return script_text, "剧本内容为空，无法解析"
 
+    # 配置：优先用工作区 config.yaml，其次弹窗内容，再次内置默认
+    if os.path.exists(_workspace_path("config.yaml")):
+        config_text = _read_text(_workspace_path("config.yaml"))
+    if not config_text.strip():
+        config_text = DEFAULT_CONFIG
     try:
         config = yaml.safe_load(config_text) or {}
     except Exception as e:
         return script_text, f"配置解析失败: {e}"
 
-    # 注入用户填写的 API Key
-    if vlm_key and vlm_key.strip():
-        config.setdefault("models", {}).setdefault("vlm", {})["api_key"] = vlm_key.strip()
-    if llm_key and llm_key.strip():
-        config.setdefault("models", {}).setdefault("llm", {})["api_key"] = llm_key.strip()
+    # 注入会话中的 API Key
+    if SESSION.vlm_key:
+        config.setdefault("models", {}).setdefault("vlm", {})["api_key"] = SESSION.vlm_key
+    if SESSION.llm_key:
+        config.setdefault("models", {}).setdefault("llm", {})["api_key"] = SESSION.llm_key
 
-    # 如果已经是结构化大纲，直接保存
     if is_structured_outline(text_to_parse):
         with open(script_path, "w", encoding="utf-8") as f:
             f.write(text_to_parse)
-        return text_to_parse, f"当前剧本（{source_label}）已是结构化大纲，无需解析"
+        return text_to_parse, f"当前剧本（{source_label}）已是结构化大纲，已保存，可直接运行剧本分析"
 
-    # 检查 LLM Key
     llm_config = config.get("models", {}).get("llm", {})
     if not llm_config.get("api_key"):
-        return script_text, "错误：未设置 LLM API Key，无法解析剧本。请在配置中填写 models.llm.api_key。"
+        return script_text, "错误：未设置 LLM API Key，请点击右上角 🔑 填写后再解析。"
 
     try:
         llm_service = LLMService(config)
@@ -472,7 +361,6 @@ def preprocess_script(
         preprocessor = ScriptPreprocessor(llm_service, preprocessor_config)
         parsed = preprocessor.preprocess(text_to_parse)
 
-        # 二次校验：先把解析结果写到临时文件，再用 parse_script_outline 验证是否真的能提取出情节点
         import tempfile
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".md", dir=work_dir)
         try:
@@ -489,120 +377,126 @@ def preprocess_script(
             return (
                 text_to_parse,
                 f"剧本解析失败（来源：{source_label}）：模型返回了结构化文本，但未能提取出任何情节点。"
-                "请检查模型输出或手动编辑成标准大纲后再试。",
             )
 
         with open(script_path, "w", encoding="utf-8") as f:
             f.write(parsed)
-
-        return parsed, f"剧本解析完成（来源：{source_label}），已生成结构化台本。建议检查并微调后再运行 Pipeline。"
+        return parsed, f"剧本解析完成（来源：{source_label}），已生成结构化台本，可检查后运行剧本分析。"
     except ScriptParseError as e:
-        # 解析失败时不把占位符写入 script.md，保留原始文本让用户手动调整
         with open(script_path, "w", encoding="utf-8") as f:
             f.write(text_to_parse)
         return (
             script_text,
-            f"剧本解析失败（来源：{source_label}）：{e}\n"
-            "右侧仍保留原始文本，你可以手动编辑成标准大纲，或尝试更换 LLM 模型后再点解析。",
+            f"剧本解析失败（来源：{source_label}）：{e}\n可手动编辑成标准大纲后再试。",
         )
     except Exception as e:
-        # 未知异常时仍保留原始文本，避免 script.md 变成未定义状态
         with open(script_path, "w", encoding="utf-8") as f:
             f.write(text_to_parse)
         return script_text, f"剧本解析失败: {e}\n{traceback.format_exc()}"
 
 
-def run_pipeline(
-    phase: str,
-    config_text: str,
-    script_text: str,
-    raw_files: list,
-    processed_files: list,
-    analyzed_videos: list,
-    analyzed_metas: list,
-    materials_dir: str = "",
-    vlm_key: str = "",
-    llm_key: str = "",
-) -> str:
-    """运行 pipeline，使用 subprocess 隔离 main.py，避免 SystemExit 导致 Gradio 崩溃"""
-    # 先准备工作区，并注入用户填写的 API Key
-    prep_msg = prepare_workspace(
-        config_text,
-        script_text,
-        raw_files,
-        processed_files,
-        analyzed_videos,
-        analyzed_metas,
-        materials_dir,
-        vlm_key,
-        llm_key,
-        clear_output=(phase == "all"),
-    )
-    if prep_msg.startswith("错误"):
-        return prep_msg
+# ----------------------------------------------------------------------
+# 工作区准备（① 准备步骤，无 AI）
+# ----------------------------------------------------------------------
 
-    config_path = os.path.join(SESSION.work_dir, "config.yaml")
-
-    # 校验 API Key（按阶段解耦：Phase 1 需 VLM，Phase 2/3 需 LLM，Phase 4 不需要）
+def prepare_workspace_files(raw_files: list, materials_dir: str = "") -> str:
+    """准备项目内工作目录：写配置、归置素材，不运行任何 AI 流程。"""
     try:
-        config = load_config(config_path)
+        ensure_dir(SESSION.work_dir)
+        ensure_dir(SESSION.output_dir)
 
-        # 未配置 VLM API Key 时，自动回退到本地 Qwen2.5-VL
-        if fallback_vlm_to_local(config):
+        # 配置：保持工作区已有 config.yaml；没有则写默认模板
+        config_path = _workspace_path("config.yaml")
+        if not os.path.exists(config_path):
             with open(config_path, "w", encoding="utf-8") as f:
-                yaml.dump(config, f, allow_unicode=True, sort_keys=False)
+                f.write(DEFAULT_CONFIG)
 
-        vlm_key = config.get("models", {}).get("vlm", {}).get("api_key")
-        llm_key = config.get("models", {}).get("llm", {}).get("api_key")
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+        if not isinstance(config, dict):
+            config = yaml.safe_load(DEFAULT_CONFIG)
 
-        vlm_env_keys = ["OPENAI_API_KEY", "ARK_API_KEY", "VLM_API_KEY"]
-        llm_env_keys = ["DEEPSEEK_API_KEY", "OPENAI_API_KEY", "LLM_API_KEY"]
+        # 素材目录
+        raw_dir = _workspace_path("materials", "raw")
+        _clear_dir_if_has_upload(raw_files, raw_dir)
+        uploaded = _copy_files_to_dir(raw_files, raw_dir)
 
-        vlm_env_key = next((k for k in vlm_env_keys if os.getenv(k)), None)
-        llm_env_key = next((k for k in llm_env_keys if os.getenv(k)), None)
+        config["paths"]["raw_materials"] = raw_dir
+        config["paths"]["output"] = SESSION.output_dir
+        config["paths"]["temp"] = _workspace_path("temp")
+        config["paths"]["script_outline"] = _workspace_path("script.md")
+        config["paths"]["reference_images"] = _workspace_path("refs")
+        for item in config.get("materials", []):
+            if item.get("state") == "RAW":
+                item["path"] = raw_dir
 
-        need_vlm = phase in ("all", "1")
-        need_llm = phase in ("all", "2", "3")
-        # Phase 0 纯 CV 粗剪不需要任何 API Key
+        if materials_dir and materials_dir.strip():
+            materials_dir_abs = os.path.abspath(materials_dir.strip())
+            config.setdefault("phase2", {})["materials_dir"] = materials_dir_abs
+            config["paths"]["raw_materials"] = materials_dir_abs
 
-        # 如果启用了本地模型，VLM 使用本地 Qwen2.5-VL，不需要在线 API Key
-        local_cfg = config.get("models", {}).get("local", {})
-        vlm_provider = config.get("models", {}).get("vlm", {}).get("provider", "openai")
-        if bool(local_cfg.get("enabled", False)) and vlm_provider == "local":
-            need_vlm = False
+        # 注入会话 API Key
+        if SESSION.vlm_key:
+            config.setdefault("models", {}).setdefault("vlm", {})["api_key"] = SESSION.vlm_key
+        if SESSION.llm_key:
+            config.setdefault("models", {}).setdefault("llm", {})["api_key"] = SESSION.llm_key
 
-        if need_vlm and not vlm_key and not vlm_env_key:
-            return (
-                f"{prep_msg}\n\n错误：未设置 VLM API Key。\n"
-                f"请在 config.yaml 中填写 models.vlm.api_key，或在系统环境变量中设置：\n"
-                f"  - OPENAI_API_KEY（OpenAI 官方）\n"
-                f"  - ARK_API_KEY（豆包/火山方舟）\n"
-                f"  - VLM_API_KEY（通用）"
-            )
-        if need_llm and not llm_key and not llm_env_key:
-            return (
-                f"{prep_msg}\n\n错误：未设置 LLM API Key。\n"
-                f"请在 config.yaml 中填写 models.llm.api_key，或在系统环境变量中设置：\n"
-                f"  - DEEPSEEK_API_KEY（DeepSeek）\n"
-                f"  - OPENAI_API_KEY（OpenAI 官方/兼容）\n"
-                f"  - LLM_API_KEY（通用）"
-            )
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(config, f, allow_unicode=True, sort_keys=False)
+
+        script_exists = os.path.exists(_workspace_path("script.md"))
+        return (
+            f"工作区已就绪: {SESSION.work_dir}\n"
+            f"已上传素材: {', '.join(uploaded) if uploaded else '无'}\n"
+            f"剧本: {'已存在 ' + _workspace_path('script.md') if script_exists else '尚未创建（到「剧本分析」步骤导入）'}"
+        )
     except Exception as e:
-        return f"{prep_msg}\n\n配置校验失败: {e}"
+        return f"准备工作区失败: {e}\n{traceback.format_exc()}"
 
-    if phase == "all":
-        phase_arg = ["--all"]
-        clean_arg = ["--clean"]
-    else:
-        phase_arg = ["--phase", str(int(phase))]
-        # 单阶段运行时让 main.py 只清理本阶段产物，保留其它阶段结果
-        clean_arg = ["--clean"]
-    cmd = [sys.executable, "main.py", "--config", config_path] + phase_arg + clean_arg
 
-    # Phase 2 独立运行时传入素材库目录
-    if phase == "2" and materials_dir and materials_dir.strip():
-        cmd += ["--materials-dir", os.path.abspath(materials_dir.strip())]
+# ----------------------------------------------------------------------
+# 步骤运行引擎（subprocess 隔离 main.py，日志进环形缓冲）
+# ----------------------------------------------------------------------
 
+PHASE_LABELS = {"2": "剧本分析", "3": "镜头筛选", "4": "剪辑导出"}
+
+
+def _validate_keys(phase: str, config: dict) -> Optional[str]:
+    """运行前校验 API Key，缺啥返回错误文案，OK 返回 None"""
+    vlm_key = config.get("models", {}).get("vlm", {}).get("api_key")
+    llm_key = config.get("models", {}).get("llm", {}).get("api_key")
+    vlm_env = any(os.getenv(k) for k in ["OPENAI_API_KEY", "ARK_API_KEY", "VLM_API_KEY"])
+    llm_env = any(os.getenv(k) for k in ["DEEPSEEK_API_KEY", "OPENAI_API_KEY", "LLM_API_KEY"])
+
+    local_cfg = config.get("models", {}).get("local", {})
+    vlm_provider = config.get("models", {}).get("vlm", {}).get("provider", "openai")
+    local_vlm = bool(local_cfg.get("enabled", False)) and vlm_provider == "local"
+
+    if phase == "2" and not llm_key and not llm_env:
+        return "错误：未设置 LLM API Key，请点击右上角 🔑 填写。"
+    if phase == "3" and not llm_key and not llm_env:
+        return "错误：未设置 LLM API Key，请点击右上角 🔑 填写。"
+    if phase in ("0", "1") and not local_vlm and not vlm_key and not vlm_env:
+        return "错误：未设置 VLM API Key，请点击右上角 🔑 填写。"
+    return None
+
+
+def _subprocess_python() -> str:
+    """优先使用项目 .venv311 的 python（含 torch 等完整依赖），否则回退当前解释器"""
+    venv_python = PROJECT_ROOT / ".venv311" / "Scripts" / "python.exe"
+    return str(venv_python) if venv_python.exists() else sys.executable
+
+
+def _run_subprocess(phase: str) -> None:
+    """在工作区内运行 main.py --phase N，日志写入 SESSION.log"""
+    config_path = _workspace_path("config.yaml")
+    cmd = [
+        _subprocess_python(), "main.py",
+        "--config", config_path,
+        "--phase", phase,
+        "--clean",
+    ]
+    SESSION.log.append(f"[运行] {' '.join(cmd)}")
     try:
         process = subprocess.Popen(
             cmd,
@@ -615,284 +509,1121 @@ def run_pipeline(
             bufsize=1,
             universal_newlines=True,
         )
-
-        log_lines = []
+        assert process.stdout is not None
         for line in process.stdout:
-            log_lines.append(line.rstrip())
-            # 限制内存占用，保留最近 500 行
-            if len(log_lines) > 500:
-                log_lines.pop(0)
-
+            line = line.rstrip()
+            if not line:
+                continue
+            SESSION.log.append(line)
+            # 提取进度文字：取最近的含阶段/百分比/计数的行
+            if any(k in line for k in ["Phase", "第", "/", "镜头", "片段", "节点", "beat"]):
+                if len(line) <= 80:
+                    SESSION.run_label = line.strip()
         return_code = process.wait()
-
-        if return_code != 0:
-            return f"{prep_msg}\n\nPipeline 退出码 {return_code}，日志如下:\n\n" + "\n".join(log_lines[-200:])
-
-        return f"{prep_msg}\n\n运行完成！\n\n" + "\n".join(log_lines[-200:])
+        SESSION.run_ok = (return_code == 0)
+        if SESSION.run_ok:
+            SESSION.log.append(f"[完成] {PHASE_LABELS.get(phase, phase)} 运行成功")
+        else:
+            SESSION.log.append(f"[失败] 退出码 {return_code}")
     except Exception as e:
-        return f"{prep_msg}\n\n启动 Pipeline 失败: {e}\n{traceback.format_exc()}"
+        SESSION.run_ok = False
+        SESSION.log.append(f"[异常] {e}\n{traceback.format_exc()}")
+    finally:
+        SESSION.running = False
+        SESSION.run_done = True
+        if SESSION.run_ok:
+            SESSION.suggest_view = {"2": "review"}.get(phase, "")
 
 
-def list_outputs() -> str:
-    """列出输出目录中的文件"""
-    if not SESSION.output_dir or not os.path.exists(SESSION.output_dir):
-        return "暂无输出文件"
+def start_step_run(phase: str) -> str:
+    """启动步骤运行（非阻塞，后台线程执行）。返回状态文案。"""
+    if SESSION.running:
+        return "已有任务在运行，请等待完成"
 
-    lines = []
-    for root, dirs, files in os.walk(SESSION.output_dir):
-        level = root.replace(SESSION.output_dir, "").count(os.sep)
-        indent = "  " * level
-        lines.append(f"{indent}{os.path.basename(root)}/")
-        subindent = "  " * (level + 1)
-        for file in sorted(files):
-            if not file.endswith(".log"):
-                lines.append(f"{subindent}{file}")
-    return "\n".join(lines) if lines else "暂无输出文件"
+    config_path = _workspace_path("config.yaml")
+    if not os.path.exists(config_path):
+        return "错误：工作区配置不存在，请先在「① 准备」步骤点击运行"
+    try:
+        config = load_config(config_path)
+    except Exception as e:
+        return f"配置读取失败: {e}"
+
+    # 运行前自动回退本地 VLM 配置（与旧行为一致）
+    if fallback_vlm_to_local(config):
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(config, f, allow_unicode=True, sort_keys=False)
+
+    err = _validate_keys(phase, config)
+    if err:
+        return err
+
+    # 前置产物检查
+    if phase == "3" and not os.path.exists(_output_path("script_beats_analysis.json")):
+        return "缺少剧本分析结果，请先完成「② 剧本分析」"
+    if phase == "4" and not (
+        os.path.exists(_output_path("phase2_selected_shots.json"))
+        or os.path.exists(_output_path("phase1_analysis.json"))
+    ):
+        return "缺少素材/筛选结果，请先完成「③ 镜头筛选」"
+
+    SESSION.running = True
+    SESSION.run_step = phase
+    SESSION.run_label = f"{PHASE_LABELS[phase]} 启动中…"
+    threading.Thread(target=_run_subprocess, args=(phase,), daemon=True).start()
+    return f"{PHASE_LABELS[phase]} 已开始运行"
 
 
-def preview_json(filename: str) -> str:
-    """预览输出 JSON 文件内容"""
-    if not SESSION.output_dir or not filename:
-        return ""
-    path = os.path.join(SESSION.output_dir, filename)
+# ----------------------------------------------------------------------
+# 数据加载
+# ----------------------------------------------------------------------
+
+def load_beats_data() -> Tuple[pd.DataFrame, pd.DataFrame, str, bool]:
+    """加载 Phase 2 剧本节点与分镜点。
+
+    返回 (beat表[可编辑列], sub_beat表, 状态摘要, 是否存在分析结果)
+    """
+    empty = pd.DataFrame()
+    path = _output_path("script_beats_analysis.json")
     if not os.path.exists(path):
-        return f"文件不存在: {path}"
+        return empty, empty, "尚未运行剧本分析", False
     try:
         with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) if filename.endswith((".yaml", ".yml")) else f.read()
-        if filename.endswith(".json"):
-            import json
-            return json.dumps(json.loads(data), ensure_ascii=False, indent=2)
-        return str(data)[:5000]
+            data = json.load(f)
+        beat_rows, sub_rows = [], []
+        for b in data.get("beats", []):
+            bid = b.get("beat_id", "")
+            if b.get("locked"):
+                bid = "🔒 " + bid
+            beat_rows.append({
+                "情节点": bid,
+                "地点": b.get("location", ""),
+                "时间": b.get("time", ""),
+                "内容": b.get("content", ""),
+                "情绪": b.get("emotion", ""),
+                "关键动作": ", ".join(b.get("key_actions", [])),
+                "关键台词": b.get("key_dialogue", ""),
+                "目标时长s": b.get("estimated_duration", 0),
+                "节奏": b.get("pace", ""),
+                "优先级": b.get("priority", ""),
+            })
+            for sb in b.get("sub_beats", []):
+                sub_rows.append({
+                    "分镜点": sb.get("sub_beat_id", ""),
+                    "所属情节点": sb.get("parent_beat_id", ""),
+                    "内容": sb.get("content", ""),
+                    "关键动作": ", ".join(sb.get("key_actions", [])),
+                    "关键台词": sb.get("key_dialogue", ""),
+                    "时长s": sb.get("estimated_duration", 0),
+                    "情绪": sb.get("emotion", ""),
+                    "节奏": sb.get("pace", ""),
+                })
+        n_beat, n_sub = len(beat_rows), len(sub_rows)
+        total = sum(r["目标时长s"] for r in beat_rows if isinstance(r["目标时长s"], (int, float)))
+        summary = f"剧本节点 {n_beat} 个 · 分镜点 {n_sub} 个 · 目标总时长 {total:.0f}s"
+        return pd.DataFrame(beat_rows), pd.DataFrame(sub_rows), summary, True
     except Exception as e:
-        return f"读取失败: {e}"
+        return empty, empty, f"加载剧本分析失败: {e}", False
 
 
-def download_file(filename: str):
-    """返回文件路径供下载"""
-    if not SESSION.output_dir or not filename:
-        return None
-    path = os.path.join(SESSION.output_dir, filename)
-    if os.path.exists(path):
-        return path
-    return None
+def load_beats_readonly_with_shots() -> pd.DataFrame:
+    """左侧剧本节点表（只读）+ 镜头栏：Phase 3 运行后显示每个节点匹配到的镜头编号与顺序。"""
+    path = _output_path("script_beats_analysis.json")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    # shot -> beat 归属与顺序（phase2_selected_shots.json 由 Phase 3 写出）
+    shot_map: Dict[str, List[str]] = {}
+    selected_path = _output_path("phase2_selected_shots.json")
+    if os.path.exists(selected_path):
+        try:
+            with open(selected_path, "r", encoding="utf-8") as f:
+                sel = json.load(f)
+            indexed = []
+            for s in sel.get("shots", []):
+                anchor = s.get("script_anchor") or {}
+                beat = anchor.get("beat", "")
+                if not beat or beat == "UNMATCHED":
+                    continue
+                # 只统计核心/保留类镜头；备选不计入"匹配镜头"
+                if s.get("status") not in ("核心", "保留", "强制保留", "待复核"):
+                    continue
+                indexed.append((beat, s.get("shot_id", ""), s.get("source_file", "")))
+            for beat, shot_id, source in indexed:
+                shot_map.setdefault(beat, []).append(f"{shot_id}")
+        except Exception:
+            pass
+
+    rows = []
+    for b in data.get("beats", []):
+        bid = b.get("beat_id", "")
+        if b.get("locked"):
+            bid = "🔒 " + bid
+        shots = shot_map.get(b.get("beat_id", ""), [])
+        rows.append({
+            "情节点": bid,
+            "内容": b.get("content", ""),
+            "目标时长s": round(b.get("estimated_duration", 0) or 0, 1),
+            "对白": (b.get("key_dialogue") or "")[:30],
+            "匹配镜头": " → ".join(shots) if shots else "—",
+            "镜头数": len(shots),
+        })
+    return pd.DataFrame(rows)
 
 
-def open_directory(kind: str) -> str:
-    """在系统文件管理器中打开目录（kind=output/materials）"""
-    if kind == "output":
-        path = SESSION.output_dir
-    elif kind == "materials":
-        path = os.path.join(SESSION.work_dir, "materials") if SESSION.work_dir else None
+def load_split_clip_configs() -> List[Dict[str, Any]]:
+    """读取 phase1_split_clips/ 下每个镜头的 Sxxx_config.json，返回 config 列表。"""
+    split_dir = _output_path(os.path.basename(RESOURCE_SPLIT_CLIPS_DIR))
+    configs: List[Dict[str, Any]] = []
+    if not os.path.isdir(split_dir):
+        return configs
+    for name in sorted(os.listdir(split_dir)):
+        if not name.endswith("_config.json"):
+            continue
+        try:
+            with open(os.path.join(split_dir, name), "r", encoding="utf-8") as f:
+                configs.append(json.load(f))
+        except Exception as e:
+            logger.warning(f"读取 {name} 失败: {e}")
+    return configs
+
+
+def load_materials_data() -> pd.DataFrame:
+    """右侧素材表：Phase 1 最终素材表（数据源 phase1_split_clips/Sxxx_config.json）。"""
+    rows = []
+    for c in load_split_clip_configs():
+        rows.append({
+            "镜头编号": c.get("shot_id", ""),
+            "源文件": c.get("source_file", ""),
+            "时长s": round(c.get("duration_sec", 0) or 0, 1),
+            "景别": c.get("shot_type", ""),
+            "运镜": c.get("camera_movement", ""),
+            "内容摘要": c.get("content_summary", ""),
+            "动作": c.get("action", ""),
+            "情绪": c.get("emotion", ""),
+        })
+    return pd.DataFrame(rows)
+
+
+def load_anchor_assignment() -> pd.DataFrame:
+    """镜头→剧情归属分配表（可编辑「归属情节点」列），用于 Phase 3 手动调整。"""
+    selected_path = _output_path("phase2_selected_shots.json")
+    if not os.path.exists(selected_path):
+        return pd.DataFrame()
+    try:
+        with open(selected_path, "r", encoding="utf-8") as f:
+            sel = json.load(f)
+        rows = []
+        for s in sel.get("shots", []):
+            anchor = s.get("script_anchor") or {}
+            beat = anchor.get("beat", "")
+            rows.append({
+                "镜头编号": s.get("shot_id", ""),
+                "源文件": s.get("source_file", ""),
+                "归属情节点": "" if beat in ("", "UNMATCHED") else beat,
+                "置信度": anchor.get("confidence", ""),
+            })
+        return pd.DataFrame(rows)
+    except Exception as e:
+        logger.warning(f"加载归属分配失败: {e}")
+        return pd.DataFrame()
+
+
+def save_anchor_assignment(df: pd.DataFrame) -> str:
+    """把手动调整写回 phase2_selected_shots.json（复用锚定校正机制）。"""
+    if df is None or df.empty:
+        return "分配表为空，未保存"
+    selected_path = _output_path("phase2_selected_shots.json")
+    if not os.path.exists(selected_path):
+        return "尚未运行镜头筛选，无法保存分配"
+    try:
+        # 导出当前锚定校正 CSV，用用户改的「归属情节点」覆盖 corrected_beat 后应用
+        csv_path = _output_path("phase2_anchor_corrections.csv")
+        export_anchor_corrections(SESSION.output_dir, csv_path)
+        corr = pd.read_csv(csv_path, encoding="utf-8-sig")
+        assign = {str(r.get("镜头编号", "")).strip(): str(r.get("归属情节点", "")).strip()
+                  for _, r in df.iterrows()}
+        corr["corrected_beat"] = corr.apply(
+            lambda r: assign.get(str(r.get("shot_id", "")).strip(), r.get("corrected_beat", "")),
+            axis=1,
+        )
+        corr.to_csv(csv_path, index=False, encoding="utf-8-sig")
+        apply_anchor_corrections(SESSION.output_dir, csv_path)
+        changed = sum(1 for v in assign.values() if v)
+        return f"已保存 {changed} 条镜头归属分配，左侧节点镜头栏已同步"
+    except Exception as e:
+        return f"保存分配失败: {e}\n{traceback.format_exc()}"
+
+
+def save_beats(df_beats: pd.DataFrame, df_sub: pd.DataFrame) -> str:
+    """保存左侧审核节点（可编辑）→ script_beats_analysis.json + workspace/script.md"""
+    if df_beats is None or df_beats.empty:
+        return "剧本节点表为空，无法保存"
+    path = _output_path("script_beats_analysis.json")
+    if not os.path.exists(path):
+        return "尚未运行剧本分析，无法保存"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        sub_map: Dict[str, List[Dict[str, Any]]] = {}
+        old_subs = {sb.get("sub_beat_id", ""):
+                    sb for b in data.get("beats", []) for sb in b.get("sub_beats", [])}
+        if df_sub is not None and not df_sub.empty:
+            for _, sr in df_sub.iterrows():
+                sb_id = str(sr.get("分镜点", "")).strip()
+                parent = str(sr.get("所属情节点", "")).strip()
+                if not sb_id or not parent:
+                    continue
+                old_sb = old_subs.get(sb_id, {})
+                sub_map.setdefault(parent, []).append({
+                    "sub_beat_id": sb_id,
+                    "parent_beat_id": parent,
+                    "act": sr.get("幕", "") or old_sb.get("act", ""),
+                    "scene": sr.get("场", "") or old_sb.get("scene", ""),
+                    "content": sr.get("内容", ""),
+                    "key_actions": _split_comma(sr.get("关键动作", "")),
+                    "key_dialogue": sr.get("关键台词", ""),
+                    "estimated_duration": float(sr.get("时长s", 0) or 0),
+                    "emotion": sr.get("情绪", ""),
+                    "pace": sr.get("节奏", ""),
+                })
+
+        updated = []
+        for _, br in df_beats.iterrows():
+            beat_id = str(br.get("情节点", "")).strip().replace("🔒", "").strip()
+            old = next((o for o in data.get("beats", []) if o.get("beat_id") == beat_id), {})
+            beat = {
+                "act": br.get("幕", "") or old.get("act", ""),
+                "scene": br.get("场", "") or old.get("scene", ""),
+                "beat_id": beat_id,
+                "location": br.get("地点", ""),
+                "time": br.get("时间", ""),
+                "content": br.get("内容", ""),
+                "emotion": br.get("情绪", ""),
+                "key_actions": _split_comma(br.get("关键动作", "")),
+                "key_dialogue": br.get("关键台词", ""),
+                "estimated_duration": float(br.get("目标时长s", 0) or 0),
+                "pace": br.get("节奏", ""),
+            }
+            beat["sub_beats"] = sub_map.get(beat_id, [])
+            for keep in ["dialogue_entries", "gender_state", "gender_transition",
+                         "emotion_intensity", "priority", "required_shots_count", "locked"]:
+                if keep in old:
+                    beat[keep] = old[keep]
+            updated.append(beat)
+
+        data["beats"] = updated
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        script_path = _workspace_path("script.md")
+        try:
+            _save_beats_to_script_md(updated, script_path)
+        except Exception as e:
+            logger.warning(f"更新 script.md 失败: {e}")
+
+        return f"已保存 {len(updated)} 个剧本节点的修改"
+    except Exception as e:
+        return f"保存失败: {e}\n{traceback.format_exc()}"
+
+
+def _save_beats_to_script_md(beats: List[Dict[str, Any]], script_path: str):
+    """把 beat/sub-beat 数据写回标准 Markdown 大纲"""
+    lines = ["# 剧本大纲", ""]
+    acts: Dict[str, List[Dict[str, Any]]] = {}
+    for b in beats:
+        acts.setdefault(b.get("act") or "未分幕", []).append(b)
+    for act, act_beats in acts.items():
+        lines.append(f"## {act}")
+        lines.append("")
+        for b in act_beats:
+            beat_id = b.get("beat_id") or f"{b.get('scene', '场')}-情节点"
+            lines.append(f"### {beat_id}")
+            lines.append(f"- 地点：{b.get('location', '')}")
+            lines.append(f"- 时间：{b.get('time', '')}")
+            lines.append(f"- 内容：{b.get('content', '')}")
+            lines.append(f"- 情绪：{b.get('emotion', '')}")
+            actions = b.get("key_actions", [])
+            if isinstance(actions, str):
+                actions = [a.strip() for a in actions.split(",") if a.strip()]
+            lines.append(f"- 关键动作：{'，'.join(actions)}")
+            lines.append(f"- 关键台词：\"{b.get('key_dialogue', '')}\"")
+            if b.get("gender_state"):
+                lines.append(f"- 性别状态：{b.get('gender_state')}")
+            if b.get("gender_transition"):
+                lines.append(f"- 状态切换：{b.get('gender_transition')}")
+            if b.get("locked"):
+                lines.append("- 标记：锁定")
+            lines.append(f"- 建议时长：{b.get('estimated_duration', '')}")
+            lines.append(f"- 节奏：{b.get('pace', '')}")
+            lines.append(f"- 优先级：{b.get('priority', '')}")
+            for sb in b.get("sub_beats", []):
+                lines.append(f"#### {sb.get('sub_beat_id', '')}")
+                lines.append(f"  - 内容：{sb.get('content', '')}")
+                lines.append(f"  - 情绪：{sb.get('emotion', '')}")
+                lines.append(f"  - 关键台词：\"{sb.get('key_dialogue', '')}\"")
+                lines.append(f"  - 建议时长：{sb.get('estimated_duration', '')}")
+            lines.append("")
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def _load_config_dict() -> Dict[str, Any]:
+    """读取 workspace/config.yaml 为 dict，注入会话 API Key。"""
+    text = _read_text(_workspace_path("config.yaml")) or DEFAULT_CONFIG
+    config = yaml.safe_load(text) or {}
+    if SESSION.vlm_key:
+        config.setdefault("models", {}).setdefault("vlm", {})["api_key"] = SESSION.vlm_key
+    if SESSION.llm_key:
+        config.setdefault("models", {}).setdefault("llm", {})["api_key"] = SESSION.llm_key
+    return config
+
+
+def read_target_duration() -> float:
+    """从 workspace/config.yaml 读 project.target_duration，返回秒。"""
+    try:
+        from src.utils import parse_duration_string
+        config = _load_config_dict()
+        return float(parse_duration_string(config.get("project", {}).get("target_duration", 0)) or 0)
+    except Exception:
+        return 0.0
+
+
+def _write_target_duration(total_sec: float) -> None:
+    """把新总时长写回 workspace/config.yaml 的 project.target_duration（保留注释）。"""
+    path = _workspace_path("config.yaml")
+    text = _read_text(path)
+    new_line = f'  target_duration: "{int(total_sec)}s"'
+    import re
+    if re.search(r"^\s*target_duration\s*:", text, flags=re.MULTILINE):
+        text = re.sub(r"^\s*target_duration\s*:.*$", new_line, text, flags=re.MULTILINE)
     else:
-        return "未知目录类型"
+        # project: 段不存在时补一个
+        if re.search(r"^project\s*:", text, flags=re.MULTILINE):
+            text = re.sub(r"^(project\s*:\s*)$", r"\1\n" + new_line, text, flags=re.MULTILINE)
+        else:
+            text = f"project:\n{new_line}\n\n" + text
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
 
-    if not path or not os.path.exists(path):
-        return f"目录不存在或尚未创建工作区: {path or kind}"
+
+def apply_target_duration(total_sec) -> str:
+    """应用用户输入的目标总时长：写回 config，并调用 LLM 按剧情重新分配各节点时长。"""
+    from types import SimpleNamespace
+    from src.services.llm_service import LLMService
 
     try:
-        if sys.platform == "win32":
-            os.startfile(path)
-        elif sys.platform == "darwin":
-            subprocess.run(["open", path], check=False)
-        else:
-            subprocess.run(["xdg-open", path], check=False)
-        return f"已打开目录: {path}"
+        total = float(total_sec or 0)
+    except (TypeError, ValueError):
+        return "目标总时长无效，请输入数字（秒）"
+    if total < 5:
+        return "目标总时长至少 5 秒"
+
+    path = _output_path("script_beats_analysis.json")
+    if not os.path.exists(path):
+        return "尚未运行剧本分析，无法分配时长"
+
+    config = _load_config_dict()
+    llm_cfg = config.get("models", {}).get("llm", {})
+    if not llm_cfg.get("api_key"):
+        return "错误：未设置 LLM API Key，请点击右上角 🔑 填写后再应用时长。"
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        beats_raw = data.get("beats", [])
+        if not beats_raw:
+            return "剧本节点为空，无法分配时长"
+
+        # 构造 analyze_script_beats 需要的轻量 beat 对象（鸭子类型）
+        beats = [SimpleNamespace(
+            beat_id=b.get("beat_id", ""),
+            act=b.get("act", ""), scene=b.get("scene", ""),
+            location=b.get("location", ""), time=b.get("time", ""),
+            content=b.get("content", ""), emotion=b.get("emotion", ""),
+            key_actions=b.get("key_actions", []) or [],
+            key_dialogue=b.get("key_dialogue", ""),
+        ) for b in beats_raw]
+
+        llm_service = LLMService(config)
+        analysis = llm_service.analyze_script_beats(beats, total)
+        if not analysis:
+            return "LLM 时长分配失败（无返回），请查看日志"
+
+        # 写回 json：只覆盖 LLM 返回的字段，保留 dialogue_entries 等其他字段
+        for b in beats_raw:
+            info = analysis.get(b.get("beat_id", ""))
+            if not info:
+                continue
+            b["estimated_duration"] = round(float(info.get("estimated_duration", 0) or 0), 1)
+            b["pace"] = info.get("pace", b.get("pace", ""))
+            b["emotion_intensity"] = info.get("emotion_intensity", b.get("emotion_intensity", 0))
+            b["priority"] = info.get("priority", b.get("priority", 3))
+            b["required_shots_count"] = info.get("required_shots_count", b.get("required_shots_count", 1))
+            if info.get("key_actions"):
+                b["key_actions"] = info["key_actions"]
+
+        data["beats"] = beats_raw
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        try:
+            _save_beats_to_script_md(beats_raw, _workspace_path("script.md"))
+        except Exception as e:
+            logger.warning(f"更新 script.md 失败: {e}")
+        _write_target_duration(total)
+
+        got = sum(b.get("estimated_duration", 0) for b in beats_raw)
+        return (f"已按新目标 {total:.0f}s 由 LLM 重新分配时长，"
+                f"各节点合计 {got:.1f}s，配置已同步")
     except Exception as e:
-        return f"打开目录失败: {e}"
+        return f"应用目标时长失败: {e}\n{traceback.format_exc()}"
 
 
-def build_ui() -> gr.Blocks:
-    """构建 Gradio 界面"""
-    with gr.Blocks(title="LLM-AutoCut 智能剪辑工作台") as demo:
-        gr.Markdown("# LLM-AutoCut 智能剪辑工作台")
-        gr.Markdown("基于多模态理解的 AI 辅助影视后期剪辑系统")
+# ----------------------------------------------------------------------
+# Phase 4 产物与资源库
+# ----------------------------------------------------------------------
+
+PRODUCT_FILES = [
+    ("成片视频", "final_with_dubbing.mp4"),
+    ("混音音频", "mixed_audio.wav"),
+    ("剪辑决策", "phase3_edit_decision.json"),
+    ("EDL 时间线", "timeline.edl"),
+    ("FCPXML 时间线", "timeline.fcpxml"),
+    ("CSV 时间线", "timeline_final.csv"),
+    ("配音信息", "dub_info.json"),
+    ("最终时间线", "timeline.json"),
+]
+
+
+def load_products() -> pd.DataFrame:
+    rows = []
+    for label, name in PRODUCT_FILES:
+        p = _output_path(name)
+        exists = os.path.exists(p)
+        rows.append({
+            "产物": label,
+            "文件名": name,
+            "状态": "已生成" if exists else "未生成",
+            "大小": _fmt_size(os.path.getsize(p)) if exists else "-",
+            "生成时间": _human_time(os.path.getmtime(p)) if exists else "-",
+        })
+    return pd.DataFrame(rows)
+
+
+def existing_product_names() -> List[str]:
+    return [name for _, name in PRODUCT_FILES if os.path.exists(_output_path(name))]
+
+
+def load_used_materials() -> List[Tuple[str, str]]:
+    """成片实际引用到的源素材 [(文件名, 路径)]，用于单独下载"""
+    path = _output_path("timeline.json")
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        seen: Dict[str, str] = {}
+        for item in data.get("timeline", []):
+            src = item.get("source_path") or ""
+            name = item.get("source_file") or os.path.basename(src)
+            if src and os.path.exists(src):
+                seen.setdefault(name, src)
+        return sorted(seen.items())
+    except Exception:
+        return []
+
+
+def load_resource_library() -> Tuple[str, pd.DataFrame]:
+    """右侧资源弹窗内容：Phase 0/1 产物（只收录 Phase 1 分析过的资源）。"""
+    lines = []
+    df = pd.DataFrame()
+
+    p0_dir = _output_path(os.path.basename(RESOURCE_ROUGH_CLIPS_DIR))
+    if os.path.isdir(p0_dir):
+        n = len([x for x in os.listdir(p0_dir) if os.path.isfile(os.path.join(p0_dir, x))])
+        lines.append(f"Phase 0 粗剪片段：{n} 个（{RESOURCE_ROUGH_CLIPS_DIR}/）")
+    split_dir = _output_path(os.path.basename(RESOURCE_SPLIT_CLIPS_DIR))
+
+    configs = load_split_clip_configs()
+    if configs:
+        lines.append(f"Phase 1 素材分析：{len(configs)} 个镜头（{RESOURCE_SPLIT_CLIPS_DIR}/ 下 Sxxx_config.json）")
+        n_clips = len([x for x in os.listdir(split_dir)
+                       if x.endswith((".mp4", ".mov"))]) if os.path.isdir(split_dir) else 0
+        lines.append(f"切分片段目录：{RESOURCE_SPLIT_CLIPS_DIR}/（{n_clips} 个视频文件）")
+        rows = []
+        for c in configs:
+            rows.append({
+                "镜头编号": c.get("shot_id", ""),
+                "片段文件": c.get("clip_path", ""),
+                "源文件": c.get("source_file", ""),
+                "时长s": round(c.get("duration_sec", 0) or 0, 1),
+                "景别": c.get("shot_type", ""),
+                "内容摘要": c.get("content_summary", ""),
+                "动作": c.get("action", ""),
+                "情绪": c.get("emotion", ""),
+            })
+        df = pd.DataFrame(rows)
+    else:
+        lines.append(f"未找到 Phase 1 素材分析结果（{RESOURCE_SPLIT_CLIPS_DIR}/），请先运行素材分析")
+
+    return "\n\n".join(lines), df
+
+
+def save_resource_edits(df: pd.DataFrame) -> str:
+    """把资源库弹窗中用户修改的「内容摘要」「动作」写回：
+    - phase1_split_clips/Sxxx_config.json（资源库/素材表的数据源）
+    - phase1_analysis.json（shot.action + cv_metadata.shot_config，Phase 2/3 匹配提示词读取）
+    - phase2_selected_shots.json（若存在，同样结构）
+    """
+    if df is None or df.empty:
+        return "资源表为空，未保存"
+    split_dir = _output_path(os.path.basename(RESOURCE_SPLIT_CLIPS_DIR))
+    edits = {
+        str(r.get("镜头编号", "")).strip(): (
+            str(r.get("内容摘要", "") or "").strip(),
+            str(r.get("动作", "") or "").strip(),
+        )
+        for _, r in df.iterrows()
+        if str(r.get("镜头编号", "")).strip()
+    }
+    if not edits:
+        return "未找到可保存的镜头编号"
+    try:
+        # 1) Sxxx_config.json
+        n_cfg = 0
+        for sid, (summary, action) in edits.items():
+            cfg_path = os.path.join(split_dir, f"{sid}_config.json")
+            if not os.path.exists(cfg_path):
+                continue
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            cfg["content_summary"] = summary
+            cfg["action"] = action
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            n_cfg += 1
+
+        # 2) 分析库 JSON（phase1_analysis.json / phase2_selected_shots.json）
+        def _apply_to_shots(shots: List[Dict[str, Any]]) -> int:
+            n = 0
+            for s in shots:
+                sid = str(s.get("shot_id", "")).strip()
+                if sid not in edits:
+                    continue
+                summary, action = edits[sid]
+                s["action"] = action
+                sc = (s.get("cv_metadata") or {}).get("shot_config")
+                if isinstance(sc, dict):
+                    sc["content_summary"] = summary
+                    sc["action"] = action
+                n += 1
+            return n
+
+        n_ana = 0
+        for name in ("phase1_analysis.json", "phase2_selected_shots.json"):
+            path = _output_path(name)
+            if not os.path.exists(path):
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            n_ana += _apply_to_shots(data.get("shots", []))
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+        return f"已保存 {n_cfg} 个镜头描述（配置文件 {n_cfg} 条，分析库 {n_ana} 条），③ 素材表已同步"
+    except Exception as e:
+        return f"保存失败: {e}\n{traceback.format_exc()}"
+
+
+# ----------------------------------------------------------------------
+# UI
+# ----------------------------------------------------------------------
+
+CUSTOM_CSS = """
+.prog-wrap { height: 6px; background: #e5e7eb; border-radius: 3px; overflow: hidden; }
+.prog-inner { height: 100%; background: #f97316; border-radius: 3px; width: 0%; transition: width .4s; }
+.prog-inner.running { width: 30%; animation: prog-slide 1.1s ease-in-out infinite; }
+@keyframes prog-slide { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
+.res-fab { position: fixed; right: 10px; top: 42%; z-index: 90; writing-mode: vertical-lr; letter-spacing: 2px; }
+.log-fab { position: fixed; right: 10px; bottom: 14px; z-index: 90; }
+.step-status { font-size: 12px; color: #6b7280; margin-top: -8px; }
+.modal-wrap { position: fixed !important; inset: 0; background: rgba(0,0,0,.45); z-index: 100;
+    display: flex; align-items: center; justify-content: center; padding: 24px; }
+.modal-wrap.hide { display: none !important; }
+.modal-wrap > .gr-group { background: var(--body-background-fill, #fff); border-radius: 12px;
+    padding: 20px; width: 720px; max-width: 92vw; max-height: 84vh; overflow: auto;
+    box-shadow: 0 12px 40px rgba(0,0,0,.25); }
+.modal-close { margin-left: auto; }
+.gr-dataframe td { white-space: normal !important; word-break: break-word; }
+"""
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def modal(title: str):
+    """模拟弹窗：Gradio 6.25 无 gr.Modal，用 fixed 定位的 Column + Group 实现。
+    标题栏右侧自带「✕」关闭按钮，返回 (容器, 关闭按钮)。"""
+    with gr.Column(visible=False, elem_classes="modal-wrap") as col:
+        with gr.Group():
+            with gr.Row():
+                gr.Markdown(f"### {title}")
+                close = gr.Button("✕", size="sm", scale=0, min_width=36,
+                                  elem_classes="modal-close")
+            yield col, close
+
+
+def _progress_html() -> str:
+    if SESSION.running:
+        label = SESSION.run_label or f"{PHASE_LABELS.get(SESSION.run_step, '')} 运行中…"
+        return (
+            '<div class="prog-wrap"><div class="prog-inner running"></div></div>'
+            f'<div style="font-size:12px;color:#9a3412;margin-top:2px">▶ {label}</div>'
+        )
+    return '<div class="prog-wrap"><div class="prog-inner" style="width:100%;background:#22c55e"></div></div>'
+
+
+def _log_summary() -> str:
+    lines = [l for l in SESSION.log if l.strip()]
+    last = lines[-1] if lines else "暂无日志"
+    if len(last) > 60:
+        last = last[:60] + "…"
+    badge = "🔴" if (SESSION.run_done and not SESSION.run_ok) else ("🟢" if SESSION.run_done else "🟠")
+    return f"{badge} {last}"
+
+
+def build_ui():
+    with gr.Blocks(title="LLM-AutoCut") as demo:
+
+        # ---------------- 顶栏 ----------------
+        with gr.Row():
+            gr.Markdown("## 🎬 LLM-AutoCut 智能剪辑工作台", scale=4)
+            btn_config = gr.Button("📄 配置", scale=0, min_width=80)
+            btn_apikey = gr.Button("🔑 API Key", scale=0, min_width=90)
+            btn_log = gr.Button("📋 日志", scale=0, min_width=80, elem_classes="log-fab")
+
+        # 细进度条（内容区顶部，运行时可见动画，完成变绿）
+        progress_html = gr.HTML(_progress_html())
 
         with gr.Row():
-            with gr.Column(scale=1):
-                gr.Markdown("### API Key 设置")
-                vlm_key_input = gr.Textbox(
-                    label="VLM API Key（视觉模型，用于 Phase 1 分析视频）",
-                    placeholder="粘贴豆包/火山方舟或 OpenAI 的 API Key",
-                    type="password",
-                    lines=1,
+            # ---------------- 左侧步骤导航 ----------------
+            with gr.Sidebar(open=True, width="200px"):
+                nav = gr.Radio(
+                    choices=["① 准备", "② 剧本分析", "③ 镜头筛选", "④ 剪辑导出"],
+                    value="① 准备",
+                    label="步骤",
                 )
-                llm_key_input = gr.Textbox(
-                    label="LLM API Key（文本模型，用于 Phase 2/3 决策）",
-                    placeholder="粘贴 DeepSeek / OpenAI / 豆包文本模型的 API Key",
-                    type="password",
-                    lines=1,
-                )
-                gr.Markdown("""
-                <small>
-                提示：Key 仅保存在当前会话中，运行前自动注入 config.yaml，不会写入项目文件。<br>
-                也可在「配置」标签页手动编辑 api_key，或设置系统环境变量 <code>ARK_API_KEY</code> / <code>DEEPSEEK_API_KEY</code>。
-                </small>
-                """)
-                phase = gr.Radio(
-                    choices=[
-                        ("完整流程", "all"),
-                        ("Phase 0: 粗剪", "0"),
-                        ("Phase 1: 素材分析", "1"),
-                        ("Phase 2: 剧本分析", "2"),
-                        ("Phase 3: 镜头筛选", "3"),
-                        ("Phase 4: 剪辑导出", "4"),
-                    ],
-                    value="all",
-                    label="运行阶段",
-                )
-                run_btn = gr.Button("运行 Pipeline", variant="primary")
+                st1 = gr.Markdown("—", elem_classes="step-status")
+                st2 = gr.Markdown("—", elem_classes="step-status")
+                st3 = gr.Markdown("—", elem_classes="step-status")
+                st4 = gr.Markdown("—", elem_classes="step-status")
 
-            with gr.Column(scale=2):
-                log_output = gr.Textbox(label="运行日志", lines=24, max_lines=40, interactive=False)
+            # ---------------- 右侧资源弹窗按钮 ----------------
+            btn_resource = gr.Button("📁\n资\n源", scale=0, min_width=44, elem_classes="res-fab")
 
-        with gr.Tabs():
-            with gr.TabItem("配置"):
-                config_editor = gr.Code(
-                    value=DEFAULT_CONFIG,
-                    language="yaml",
-                    label="config.yaml",
-                    lines=30,
-                )
-            with gr.TabItem("剧本"):
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        script_upload = gr.File(
-                            file_count="single",
-                            file_types=[".md", ".txt", ".docx", ".pdf"],
-                            label="导入剧本文档",
-                        )
-                        parse_script_btn = gr.Button("自动解析为台本", variant="secondary")
-                        save_script_btn = gr.Button("保存剧本", variant="primary")
-                        script_status = gr.Textbox(label="剧本处理状态", interactive=False)
-                    with gr.Column(scale=2):
-                        script_editor = gr.Code(
-                            value=DEFAULT_SCRIPT,
-                            language="markdown",
-                            label="script.md（可在此编辑）",
-                            lines=30,
-                        )
-            with gr.TabItem("素材"):
-                with gr.Row():
-                    with gr.Column():
-                        materials_dir_input = gr.Textbox(
-                            label="素材库文件夹路径（Phase 2 独立运行时使用）",
-                            placeholder="粘贴素材库文件夹的绝对路径，如 D:\\素材库\\雨夜告白",
-                            lines=1,
-                        )
-                with gr.Row():
-                    with gr.Column():
+            # ---------------- 步骤面板 ----------------
+            with gr.Column(scale=8):
+
+                # ===== ① 准备 =====
+                with gr.Column(visible=True) as panel1:
+                    with gr.Row():
+                        run1 = gr.Button("▶ 准备工作区", variant="primary", scale=0)
+                        prep_status = gr.Textbox(label="状态", interactive=False, scale=3)
+                    with gr.Row():
                         raw_upload = gr.File(
                             file_count="multiple",
-                            file_types=[".mp4", ".mov", ".avi", ".mkv", ".mxf", ".webm"],
-                            label="RAW 素材（分析 + 切分）",
+                            file_types=[".mp4", ".mov", ".avi", ".mkv", ".webm"],
+                            label="上传 RAW 素材",
                         )
-                    with gr.Column():
-                        processed_upload = gr.File(
-                            file_count="multiple",
-                            file_types=[".mp4", ".mov", ".avi", ".mkv", ".mxf", ".webm"],
-                            label="PROCESSED 素材（只分析，不切分）",
-                        )
-                with gr.Row():
-                    with gr.Column():
-                        analyzed_upload = gr.File(
-                            file_count="multiple",
-                            file_types=[".mp4", ".mov", ".avi", ".mkv", ".mxf", ".webm"],
-                            label="ANALYZED 素材视频（只转译配置）",
-                        )
-                    with gr.Column():
-                        analyzed_meta_upload = gr.File(
-                            file_count="multiple",
-                            file_types=[".json", ".csv"],
-                            label="ANALYZED 素材配置文件（JSON / CSV）",
-                        )
-                gr.Markdown("""
-                <small>
-                提示：三种素材会自动放入对应子目录。<br>
-                RAW：原始片场素材；PROCESSED：人工已处理好的镜头；ANALYZED：已有分析结果需转译。<br>
-                ANALYZED 的配置文件命名需与视频同名或带 <code>_config</code> / <code>_meta</code> 后缀，如 <code>scene.mp4 + scene_config.json</code>。<br>
-                <strong>Phase 2 独立运行</strong>时，可只填写「素材库文件夹路径」，系统会做 CV 轻量清点并匹配剧本。
-                </small>
-                """)
-            with gr.TabItem("结果"):
-                with gr.Row():
-                    refresh_btn = gr.Button("刷新输出文件列表")
-                    open_output_btn = gr.Button("打开输出目录")
-                    open_materials_btn = gr.Button("打开素材目录")
-                with gr.Row():
-                    preview_select = gr.Dropdown(
-                        choices=[],
-                        label="选择文件预览",
-                        interactive=True,
+                    materials_dir = gr.Textbox(
+                        label="素材库文件夹路径（可选）",
+                        placeholder="D:\\素材库\\项目名",
+                        lines=1,
                     )
-                output_list = gr.Textbox(label="输出文件", lines=10, interactive=False)
-                preview_box = gr.Code(label="文件预览", language="json", lines=30, interactive=False)
-                download_btn = gr.Button("下载选中文件")
-                download_file_obj = gr.File(label="下载")
+                    prep_summary = gr.Markdown("")
 
-            with gr.TabItem("Phase 2 审核"):
-                gr.Markdown("### Phase 2 剧本分析与分镜点审核\n\n在此查看由剧本拆解出的情节点（beat）和分镜点（sub-beat），可直接编辑后保存。")
-                with gr.Row():
-                    refresh_phase2_btn = gr.Button("刷新审核表", variant="secondary")
-                    save_phase2_btn = gr.Button("保存修改", variant="primary")
-                phase2_status = gr.Textbox(label="状态", interactive=False)
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        beats_df = gr.DataFrame(label="剧本节点表 (script_beats_analysis.json)", interactive=True)
-                        beats_review_box = gr.Code(label="剧本节点审核 Markdown (phase2_beats_review.md)", language="markdown", lines=10, interactive=False)
-                    with gr.Column(scale=1):
-                        sub_beat_df = gr.DataFrame(label="分镜点表 (sub-beat)", interactive=True)
-                beat_ref_box = gr.Textbox(label="可用 beat_id / sub_beat_id 参考", lines=4, interactive=False)
+                # ===== ② 剧本分析 =====
+                with gr.Column(visible=False) as panel2:
+                    with gr.Row():
+                        run2 = gr.Button("▶ 运行剧本分析（Phase 2）", variant="primary", scale=0)
+                        save2 = gr.Button("保存修改", scale=0)
+                        change2 = gr.Button("更改剧本", scale=0)
+                        script_status = gr.Textbox(label="状态", interactive=False, scale=3)
+                    with gr.Row():
+                        target_dur = gr.Number(
+                            label="目标总时长（秒）· 用户输入，AI 按剧情配平",
+                            minimum=5, step=5, scale=0, min_width=160,
+                        )
+                        apply_dur = gr.Button("应用时长（AI 重新分配）", scale=0)
+                        dur_status = gr.Textbox(label="时长状态", interactive=False, scale=3)
 
-            with gr.TabItem("Phase 3 审核"):
-                gr.Markdown("### Phase 3 镜头筛选与排序\n\n在此查看每个镜头的匹配得分、选择状态和去重结果，可手动修正镜头-剧本锚定。")
-                with gr.Row():
-                    refresh_phase3_btn = gr.Button("刷新 Phase 3 筛选表", variant="secondary")
-                    export_anchor_btn = gr.Button("导出锚定校正表", variant="secondary")
-                    apply_anchor_btn = gr.Button("应用锚定校正", variant="primary")
-                phase3_status = gr.Textbox(label="状态", interactive=False)
-                with gr.Row():
-                    with gr.Column(scale=2):
-                        dedup_df = gr.DataFrame(label="去重/选择表 (phase2_deduplication.csv)", interactive=False)
-                    with gr.Column(scale=1):
-                        anchor_df = gr.DataFrame(label="锚定校正表（可编辑列：corrected_beat / corrected_confidence / corrected_function / corrected_reasoning / notes）", interactive=True)
+                    # 编辑态：无分析结果 / 用户点「更改剧本」
+                    with gr.Column(visible=True) as script_edit_view:
+                        with gr.Row():
+                            script_upload = gr.File(
+                                file_count="single",
+                                file_types=[".md", ".txt", ".docx", ".pdf"],
+                                label="导入剧本（自动解析为台本）",
+                            )
+                            parse_btn = gr.Button("解析为台本", variant="secondary", scale=0)
+                        script_editor = gr.Code(
+                            value=DEFAULT_SCRIPT, language="markdown",
+                            label="剧本编写（可直接编辑）", lines=22,
+                        )
+                        with gr.Row():
+                            split_anchor = gr.Textbox(
+                                label="一键分镜头：填入定位文字（节点内容中的几个字）",
+                                placeholder="例如：黑猫跃起",
+                                scale=3,
+                            )
+                            split_btn = gr.Button("✂️ 在此拆分镜头节点", variant="secondary", scale=0)
+                        split_msg = gr.Markdown("")
 
-            with gr.TabItem("Phase 4 导出"):
-                gr.Markdown("### Phase 4 剪辑决策与导出\n\n在此查看剪辑决策时间线、最终成片和工程文件。")
-                with gr.Row():
-                    refresh_phase4_btn = gr.Button("刷新导出产物", variant="secondary")
-                    open_output_btn2 = gr.Button("打开输出目录", variant="secondary")
-                phase4_status = gr.Textbox(label="状态", interactive=False)
-                phase4_summary = gr.Textbox(label="决策概览", lines=2, interactive=False)
-                with gr.Row():
-                    with gr.Column(scale=2):
-                        phase4_timeline_df = gr.DataFrame(label="剪辑决策时间线 (phase3_edit_decision.json)", interactive=False)
-                    with gr.Column(scale=1):
-                        phase4_final_timeline_df = gr.DataFrame(label="最终成片时间线 (timeline.json)", interactive=False)
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        phase4_video_preview = gr.Video(label="成片预览 (final_with_dubbing.mp4)")
-                    with gr.Column(scale=1):
-                        phase4_audio_preview = gr.Audio(label="混音预览 (mixed_audio.wav)")
-                phase4_files_df = gr.DataFrame(label="导出产物列表", interactive=False)
-                phase4_download_file = gr.File(label="下载选中产物")
+                    # 审核态：左右分屏，左侧可改右侧只读
+                    with gr.Column(visible=False) as script_review_view:
+                        beats_md = gr.Markdown("")
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                beats_df = gr.DataFrame(
+                                    label="剧本审核节点（左侧 · 可编辑）",
+                                    interactive=True, wrap=True,
+                                    column_widths={"内容": "230px", "关键动作": "180px", "关键台词": "230px"},
+                                )
+                                sub_beat_df = gr.DataFrame(
+                                    label="分镜点（可编辑）",
+                                    interactive=True, wrap=True,
+                                    column_widths={"内容": "230px", "关键动作": "180px", "关键台词": "230px"},
+                                )
+                            with gr.Column(scale=1):
+                                beats_ro_df = gr.DataFrame(
+                                    label="剧本节点表（右侧 · 只读）",
+                                    interactive=False, wrap=True,
+                                    column_widths={"内容": "230px", "关键动作": "180px", "关键台词": "230px"},
+                                )
+                                sub_beat_ro_df = gr.DataFrame(
+                                    label="分镜点表（只读）",
+                                    interactive=False, wrap=True,
+                                    column_widths={"内容": "230px", "关键动作": "180px", "关键台词": "230px"},
+                                )
 
+                # ===== ③ 镜头筛选 =====
+                with gr.Column(visible=False) as panel3:
+                    with gr.Row():
+                        run3 = gr.Button("▶ 运行镜头筛选（Phase 3）", variant="primary", scale=0)
+                        save3 = gr.Button("保存镜头分配", scale=0)
+                        match_status = gr.Textbox(label="状态", interactive=False, scale=3)
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            beats_shots_df = gr.DataFrame(
+                                label="剧本节点表（左侧 · 含镜头栏）",
+                                interactive=False, wrap=True,
+                                column_widths={"内容": "230px", "对白": "180px"},
+                            )
+                        with gr.Column(scale=1):
+                            materials_df = gr.DataFrame(
+                                label="素材表（Phase 1 分析结果）",
+                                interactive=False, wrap=True,
+                                column_widths={"源文件": "160px", "内容摘要": "230px", "动作": "180px"},
+                            )
+                            assign_df = gr.DataFrame(
+                                label="镜头归属分配（改「归属情节点」列后保存）",
+                                interactive=True, wrap=True,
+                                column_widths={"源文件": "160px", "动作": "180px"},
+                            )
+
+                # ===== ④ 剪辑导出 =====
+                with gr.Column(visible=False) as panel4:
+                    with gr.Row():
+                        run4 = gr.Button("▶ 运行剪辑导出（Phase 4）", variant="primary", scale=0)
+                        export_status = gr.Textbox(label="状态", interactive=False, scale=3)
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            beats_ro4_df = gr.DataFrame(
+                                label="剧本节点表", interactive=False, wrap=True,
+                                column_widths={"内容": "230px", "对白": "180px"},
+                            )
+                        with gr.Column(scale=2):
+                            final_video = gr.Video(label="成片预览")
+                            export_summary = gr.Textbox(label="决策概览", interactive=False, lines=2)
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            products_df = gr.DataFrame(
+                                label="导出产物（可单独下载）", interactive=False, wrap=True,
+                                column_widths={"文件名": "230px"},
+                            )
+                            product_pick = gr.Dropdown(label="选择产物下载", choices=[], interactive=True)
+                            product_file = gr.File(label="产物文件")
+                        with gr.Column(scale=1):
+                            used_md = gr.Markdown("**成片用到的素材**")
+                            used_pick = gr.Dropdown(label="选择素材下载", choices=[], interactive=True)
+                            used_file = gr.File(label="素材文件")
+
+        # ---------------- 弹窗 ----------------
+        with modal("配置（config.yaml）") as (config_modal, config_close):
+            config_editor = gr.Code(language="yaml", label="config.yaml", lines=26)
+            with gr.Row():
+                config_save = gr.Button("保存配置", variant="primary")
+                config_msg = gr.Markdown("")
+
+        with modal("API Key（仅保存在当前会话，运行时注入配置）") as (apikey_modal, key_close):
+            vlm_key_input = gr.Textbox(label="VLM Key（豆包 ARK / OpenAI 等）", type="password")
+            llm_key_input = gr.Textbox(label="LLM Key（DeepSeek 等）", type="password")
+            with gr.Row():
+                key_save = gr.Button("保存", variant="primary")
+                key_msg = gr.Markdown("")
+
+        with modal("运行日志") as (log_modal, log_close):
+            log_code = gr.Code(label="日志（自动滚动到底部）", language="markdown", lines=30, interactive=False)
+
+        with modal("素材资源库（Phase 0 / Phase 1 产物）") as (resource_modal, resource_close):
+            resource_md = gr.Markdown("")
+            resource_df = gr.DataFrame(
+                interactive=True, wrap=True,
+                column_widths={"源文件": "160px", "内容摘要": "230px", "动作": "180px"},
+            )
+            with gr.Row():
+                resource_save = gr.Button("💾 保存修改（内容摘要 / 动作）", variant="primary", scale=0)
+                resource_msg = gr.Markdown("", scale=3)
+
+        with modal("确认更改剧本？") as (confirm_modal, confirm_close):
+            gr.Markdown("已有剧本分析结果会被保留，重新分析后覆盖。确认进入剧本编辑？")
+            with gr.Row():
+                confirm_yes = gr.Button("确认更改", variant="stop")
+                confirm_no = gr.Button("取消")
+
+        timer = gr.Timer(1.0, active=True)
+
+        # ==================================================================
         # 事件绑定
-        run_btn.click(
-            fn=run_pipeline,
-            inputs=[
-                phase,
-                config_editor,
-                script_editor,
-                raw_upload,
-                processed_upload,
-                analyzed_upload,
-                analyzed_meta_upload,
-                materials_dir_input,
-                vlm_key_input,
-                llm_key_input,
+        # ==================================================================
+
+        run_btns = [run1, run2, run3, run4]
+
+        def _btns_state(interactive: bool):
+            return [gr.update(interactive=interactive) for _ in run_btns]
+
+        def _script_views():
+            """决定 ② 剧本页显示编辑态还是审核态"""
+            _, _, _, has = load_beats_data()
+            if SESSION.force_edit_view:
+                return gr.update(visible=True), gr.update(visible=False)
+            if has:
+                return gr.update(visible=False), gr.update(visible=True)
+            return gr.update(visible=True), gr.update(visible=False)
+
+        def _refresh_values():
+            """加载全部步骤数据，返回 dict"""
+            beats_df_v, sub_df_v, beats_summary, has_analysis = load_beats_data()
+            beats_ro4_v = load_beats_readonly_with_shots() if has_analysis else pd.DataFrame()
+            beats_shots_v = beats_ro4_v
+            materials_v = load_materials_data()
+            assign_v = load_anchor_assignment()
+            products_v = load_products()
+            used = load_used_materials()
+            video_path = _output_path("final_with_dubbing.mp4")
+
+            n_generated = sum(1 for _, n in PRODUCT_FILES if os.path.exists(_output_path(n)))
+            export_summary_v = ""
+            tpath = _output_path("timeline.json")
+            if os.path.exists(tpath):
+                try:
+                    with open(tpath, "r", encoding="utf-8") as f:
+                        tdata = json.load(f)
+                    export_summary_v = f"成片镜头 {tdata.get('total_clips', len(tdata.get('timeline', [])))} 个 · 产物 {n_generated}/{len(PRODUCT_FILES)}"
+                except Exception:
+                    pass
+            if os.path.exists(video_path):
+                dur = 0.0
+                try:
+                    r = subprocess.run(
+                        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                         "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+                        capture_output=True, text=True, check=False)
+                    dur = float(r.stdout.strip() or 0)
+                except Exception:
+                    pass
+                if dur:
+                    export_summary_v += f" · 成片时长 {dur:.1f}s"
+
+            # 侧栏状态
+            script_ok = os.path.exists(_workspace_path("script.md"))
+            matched = os.path.exists(_output_path("phase2_selected_shots.json"))
+            st1_v = "✓ 工作区就绪" if script_ok else "待准备：上传素材并运行"
+            st2_v = f"✓ {beats_summary}" if has_analysis else "未分析"
+            if matched:
+                try:
+                    with open(_output_path("phase2_selected_shots.json"), "r", encoding="utf-8") as f:
+                        n_shots = len(json.load(f).get("shots", []))
+                    st3_v = f"✓ 已筛选（{n_shots} 镜头）"
+                except Exception:
+                    st3_v = "✓ 已筛选"
+            else:
+                st3_v = "未运行"
+            st4_v = "✓ 成片已生成" if os.path.exists(video_path) else "未导出"
+
+            edit_vis, review_vis = (gr.update(visible=True), gr.update(visible=False)) \
+                if SESSION.force_edit_view or not has_analysis else \
+                (gr.update(visible=False), gr.update(visible=True))
+
+            return {
+                "progress": _progress_html(),
+                "logfab": f"📋 日志\n{_log_summary()[:40]}",
+                "log_code": "\n".join(SESSION.log),
+                "prep_status": SESSION.status_msgs["prep"],
+                "script_status": SESSION.status_msgs["script"],
+                "match_status": SESSION.status_msgs["match"],
+                "export_status": SESSION.status_msgs["export"],
+                "st1": st1_v, "st2": st2_v, "st3": st3_v, "st4": st4_v,
+                "beats_df": beats_df_v, "sub_df": sub_df_v,
+                "beats_ro": beats_df_v, "sub_ro": sub_df_v,
+                "beats_md": beats_summary,
+                "edit_vis": edit_vis, "review_vis": review_vis,
+                "beats_shots": beats_shots_v,
+                "beats_ro4": beats_ro4_v,
+                "materials": materials_v, "assign": assign_v,
+                "video": gr.update(value=video_path if os.path.exists(video_path) else None),
+                "export_summary": export_summary_v,
+                "products": products_v,
+                "product_choices": gr.update(choices=existing_product_names()),
+                "used_choices": gr.update(choices=[n for n, _ in used]),
+                "used_md": "**成片用到的素材**" + ("" if used else "\n\n（尚未生成剪辑时间线）"),
+                "run_btns": _btns_state(not SESSION.running),
+            }
+
+        TICK_KEYS = [
+            # 总是刷新区（进度/日志/各步骤状态，运行中也要可见）
+            "progress", "logfab", "log_code",
+            "prep_status", "script_status", "match_status", "export_status",
+            # 数据区（仅运行完成时刷新，避免表格/视频闪烁）
+            "st1", "st2", "st3", "st4",
+            "beats_df", "sub_df", "beats_ro", "sub_ro", "beats_md",
+            "edit_vis", "review_vis",
+            "beats_shots", "beats_ro4", "materials", "assign",
+            "video", "export_summary", "products", "product_choices", "used_choices", "used_md",
+            "b1", "b2", "b3", "b4",
+        ]
+
+        TICK_COMPONENTS = [
+            progress_html, btn_log, log_code,
+            prep_status, script_status, match_status, export_status,
+            st1, st2, st3, st4,
+            beats_df, sub_beat_df, beats_ro_df, sub_beat_ro_df, beats_md,
+            script_edit_view, script_review_view,
+            beats_shots_df, beats_ro4_df, materials_df, assign_df,
+            final_video, export_summary, products_df, product_pick, used_pick, used_md,
+            run1, run2, run3, run4,
+        ]
+
+        # 总是刷新区的组件个数（progress/logfab/log_code + 4 个状态）
+        TICK_ALWAYS = 7
+        # 运行完成时，把结果写进步骤状态栏：TICK_KEYS 中的下标
+        TICK_STEP_STATUS_IDX = {"2": 4, "3": 5, "4": 6}
+
+        def on_tick():
+            full = SESSION.run_done
+            step = ""
+            result_msg = ""
+            if full:
+                SESSION.run_done = False
+                step = SESSION.run_step
+                result_msg = "运行完成 ✓" if SESSION.run_ok else "运行失败，请展开日志查看"
+                if step == "2" and SESSION.run_ok:
+                    SESSION.force_edit_view = False
+                SESSION.run_step = ""
+                SESSION.log.append(f"[状态] {result_msg}")
+            vals = _refresh_values()
+            out = [vals[k] for k in TICK_KEYS[:-4]]  # 末尾 4 项是按钮，由 run_btns 提供
+            if full:
+                idx = TICK_STEP_STATUS_IDX.get(step)
+                if idx is not None:
+                    out[idx] = result_msg
+                    status_key = {"2": "script", "3": "match", "4": "export"}.get(step)
+                    if status_key:
+                        SESSION.status_msgs[status_key] = result_msg
+            out += vals["run_btns"]
+            # 非完成时刻，数据类组件不刷新，避免表格/视频闪烁
+            if not full:
+                for i in range(TICK_ALWAYS, len(out) - 4):
+                    out[i] = gr.update()
+            return out
+
+        timer.tick(fn=on_tick, outputs=TICK_COMPONENTS)
+
+        # ---------------- 步骤切换 ----------------
+        def on_nav(step):
+            vis = [gr.update(visible=(step == s)) for s in
+                   ["① 准备", "② 剧本分析", "③ 镜头筛选", "④ 剪辑导出"]]
+            vals = _refresh_values()
+            return vis + [
+                vals["st1"], vals["st2"], vals["st3"], vals["st4"],
+                vals["beats_df"], vals["sub_df"], vals["beats_ro"], vals["sub_ro"],
+                vals["beats_md"], vals["edit_vis"], vals["review_vis"],
+                vals["beats_shots"], vals["beats_ro4"], vals["materials"], vals["assign"],
+                vals["video"], vals["export_summary"], vals["products"],
+                vals["product_choices"], vals["used_choices"], vals["used_md"],
+            ]
+
+        nav.change(
+            fn=on_nav,
+            inputs=[nav],
+            outputs=[
+                panel1, panel2, panel3, panel4,
+                st1, st2, st3, st4,
+                beats_df, sub_beat_df, beats_ro_df, sub_beat_ro_df,
+                beats_md, script_edit_view, script_review_view,
+                beats_shots_df, beats_ro4_df, materials_df, assign_df,
+                final_video, export_summary, products_df,
+                product_pick, used_pick, used_md,
             ],
-            outputs=log_output,
+        )
+
+        # ---------------- ① 准备 ----------------
+        def on_prepare(raw_files, materials_dir):
+            if SESSION.running:
+                return "已有任务在运行", ""
+            msg = prepare_workspace_files(raw_files or [], materials_dir or "")
+            SESSION.status_msgs["prep"] = msg
+            return msg, msg.replace("\n", "\n\n")
+
+        run1.click(
+            fn=on_prepare,
+            inputs=[raw_upload, materials_dir],
+            outputs=[prep_status, prep_summary],
+        )
+
+        # ---------------- ② 剧本 ----------------
+        def on_run2():
+            msg = start_step_run("2")
+            SESSION.status_msgs["script"] = msg
+            if msg.endswith("已开始运行"):
+                SESSION.force_edit_view = False
+                return msg, *_btns_state(False)
+            return msg, *_btns_state(True)
+
+        run2.click(fn=on_run2, outputs=[script_status, run1, run2, run3, run4])
+
+        def on_save2(d, s):
+            msg = save_beats(d, s)
+            SESSION.status_msgs["script"] = msg
+            return msg
+
+        save2.click(
+            fn=on_save2,
+            inputs=[beats_df, sub_beat_df],
+            outputs=[script_status],
+        )
+
+        def on_apply_dur(v):
+            msg = apply_target_duration(v)
+            vals = _refresh_values()
+            return msg, vals["beats_df"], vals["sub_df"], vals["beats_ro"], vals["sub_ro"], vals["beats_md"]
+
+        apply_dur.click(
+            fn=on_apply_dur,
+            inputs=[target_dur],
+            outputs=[dur_status, beats_df, sub_beat_df, beats_ro_df, sub_beat_ro_df, beats_md],
         )
 
         script_upload.change(
@@ -901,576 +1632,198 @@ def build_ui() -> gr.Blocks:
             outputs=[script_editor, script_status],
         )
 
-        parse_script_btn.click(
+        parse_btn.click(
             fn=preprocess_script,
-            inputs=[config_editor, script_editor, script_upload, vlm_key_input, llm_key_input],
+            inputs=[script_editor, script_upload],
             outputs=[script_editor, script_status],
         )
 
-        def save_script(script_text: str):
-            """把剧本编辑器中的内容保存到 workspace/script.md"""
-            if not SESSION.work_dir:
-                SESSION.work_dir = str(WORKSPACE_DIR)
-            script_path = os.path.join(SESSION.work_dir, "script.md")
-            try:
-                ensure_dir(SESSION.work_dir)
-                with open(script_path, "w", encoding="utf-8") as f:
-                    f.write(script_text)
-                return f"剧本已保存: {script_path}"
-            except Exception as e:
-                return f"保存剧本失败: {e}\n{traceback.format_exc()}"
+        def on_split_beat(script_text, anchor):
+            """一键分镜头：在包含定位文字的行后插入一个锁定的空分节点，交给 AI 补全"""
+            anchor = (anchor or "").strip()
+            if not script_text or not script_text.strip():
+                return script_text, "台本为空，无法拆分"
+            if not anchor:
+                return script_text, "请先填入定位文字（要拆分位置对应的几个字）"
+            lines = script_text.split("\n")
+            hit = next((idx for idx, line in enumerate(lines) if anchor in line), -1)
+            if hit < 0:
+                return script_text, f"未找到「{anchor}」，多打几个字再试"
+            n = 1
+            while f"### 分节点·{n}" in script_text:
+                n += 1
+            node = [
+                "",
+                f"### 分节点·{n}",
+                "- 标记：锁定",
+                "（此节点内容留空，AI 重新分析时将依据上下文补全；"
+                "也可在此行下加「- 内容：...」直接填写）",
+                "",
+            ]
+            new_text = "\n".join(lines[:hit + 1] + node + lines[hit + 1:])
+            return new_text, f"已插入「分节点·{n}」（锁定）。确认后点「解析为台本」保存，再运行剧本分析生效"
 
-        save_script_btn.click(
-            fn=save_script,
-            inputs=[script_editor],
-            outputs=[script_status],
+        split_btn.click(
+            fn=on_split_beat,
+            inputs=[script_editor, split_anchor],
+            outputs=[script_editor, split_msg],
         )
 
-        def refresh_outputs():
-            if not SESSION.output_dir or not os.path.exists(SESSION.output_dir):
-                return "暂无输出文件", gr.update(choices=[])
-            choices = []
-            for root, _, files in os.walk(SESSION.output_dir):
-                for file in sorted(files):
-                    if not file.endswith(".log"):
-                        choices.append(os.path.relpath(os.path.join(root, file), SESSION.output_dir))
-            return list_outputs(), gr.update(choices=choices, value=choices[0] if choices else None)
-
-        refresh_btn.click(
-            fn=refresh_outputs,
-            inputs=[],
-            outputs=[output_list, preview_select],
+        change2.click(
+            fn=lambda: gr.update(visible=True),
+            outputs=[confirm_modal],
         )
 
-        preview_select.change(
-            fn=preview_json,
-            inputs=[preview_select],
-            outputs=preview_box,
-        )
-
-        download_btn.click(
-            fn=download_file,
-            inputs=[preview_select],
-            outputs=download_file_obj,
-        )
-
-        open_output_btn.click(
-            fn=open_directory,
-            inputs=[gr.Textbox(value="output", visible=False)],
-            outputs=log_output,
-        )
-        open_materials_btn.click(
-            fn=open_directory,
-            inputs=[gr.Textbox(value="materials", visible=False)],
-            outputs=log_output,
-        )
-
-        # ------------------------------------------------------------------
-        # Phase 2 审核面板函数
-        # ------------------------------------------------------------------
-        def _load_csv_if_exists(csv_path: str) -> pd.DataFrame:
-            if not csv_path or not os.path.exists(csv_path):
-                return pd.DataFrame()
-            try:
-                return pd.read_csv(csv_path, encoding="utf-8-sig")
-            except Exception:
-                try:
-                    return pd.read_csv(csv_path, encoding="utf-8")
-                except Exception:
-                    return pd.DataFrame()
-
-        def _load_beats_and_sub_beats():
-            """加载剧本节点和分镜点，返回 (beats_df, sub_beat_df, ref_text, status)"""
-            analysis_path = os.path.join(SESSION.output_dir, "script_beats_analysis.json")
-            if not os.path.exists(analysis_path):
-                return pd.DataFrame(), pd.DataFrame(), "", "尚未运行 Phase 2，无输出文件"
-            try:
-                with open(analysis_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-
-                beat_rows = []
-                sub_rows = []
-                ref_lines = []
-                for b in data.get("beats", []):
-                    beat_rows.append({
-                        "beat_id": b.get("beat_id", ""),
-                        "act": b.get("act", ""),
-                        "scene": b.get("scene", ""),
-                        "content": b.get("content", ""),
-                        "key_actions": ", ".join(b.get("key_actions", [])),
-                        "key_dialogue": b.get("key_dialogue", ""),
-                        "estimated_duration": b.get("estimated_duration", 0),
-                        "pace": b.get("pace", ""),
-                        "priority": b.get("priority", ""),
-                        "emotion_intensity": b.get("emotion_intensity", ""),
-                    })
-                    ref_lines.append(f"{b.get('beat_id', '')}: {b.get('content', '')[:80]}")
-
-                    for sb in b.get("sub_beats", []):
-                        sub_rows.append({
-                            "sub_beat_id": sb.get("sub_beat_id", ""),
-                            "parent_beat_id": sb.get("parent_beat_id", ""),
-                            "content": sb.get("content", ""),
-                            "key_actions": ", ".join(sb.get("key_actions", [])),
-                            "key_dialogue": sb.get("key_dialogue", ""),
-                            "estimated_duration": sb.get("estimated_duration", 0),
-                            "emotion": sb.get("emotion", ""),
-                            "pace": sb.get("pace", ""),
-                            "gender_state": sb.get("gender_state", ""),
-                            "gender_transition": sb.get("gender_transition", ""),
-                        })
-                        ref_lines.append(f"  {sb.get('sub_beat_id', '')}: {sb.get('content', '')[:80]}")
-
-                status = f"已加载 Phase 2 审核表。剧本节点: {len(beat_rows)} 个, 分镜点: {len(sub_rows)} 个。"
-                return pd.DataFrame(beat_rows), pd.DataFrame(sub_rows), "\n".join(ref_lines), status
-            except Exception as e:
-                return pd.DataFrame(), pd.DataFrame(), "", f"加载剧本节点失败: {e}"
-
-        def refresh_phase2_review():
-            if not SESSION.output_dir or not os.path.exists(SESSION.output_dir):
-                return pd.DataFrame(), pd.DataFrame(), "", "", "尚未运行 Phase 2，无输出文件"
-
-            beats_df, sub_beat_df, beat_ref, status = _load_beats_and_sub_beats()
-
-            md_path = os.path.join(SESSION.output_dir, "phase2_beats_review.md")
-            md_text = ""
-            if os.path.exists(md_path):
-                with open(md_path, "r", encoding="utf-8") as f:
-                    md_text = f.read()
-
-            return beats_df, sub_beat_df, md_text, beat_ref, status
-
-        def _split_comma(text: Any) -> List[str]:
-            if pd.isna(text) or text is None:
-                return []
-            return [s.strip() for s in str(text).split(",") if s.strip()]
-
-        def save_phase2_beats(df_beats, df_sub_beats):
-            """把用户在网页端对 beat / sub-beat 的修改保存回 script_beats_analysis.json 和 workspace/script.md"""
-            if not SESSION.output_dir or not os.path.exists(SESSION.output_dir):
-                return "尚未运行 Phase 2，无法保存"
-            if df_beats is None or df_beats.empty:
-                return "剧本节点表为空，无法保存"
-
-            analysis_path = os.path.join(SESSION.output_dir, "script_beats_analysis.json")
-            if not os.path.exists(analysis_path):
-                return f"找不到 {analysis_path}"
-
-            try:
-                with open(analysis_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-
-                # 用 DataFrame 更新 beats
-                beat_rows = df_beats.to_dict("records")
-                sub_rows = df_sub_beats.to_dict("records") if df_sub_beats is not None and not df_sub_beats.empty else []
-
-                sub_beat_map = {}
-                for sr in sub_rows:
-                    sb_id = sr.get("sub_beat_id", "")
-                    parent = sr.get("parent_beat_id", "")
-                    if not sb_id or not parent:
-                        continue
-                    sub_beat_map.setdefault(parent, []).append({
-                        "sub_beat_id": sb_id,
-                        "parent_beat_id": parent,
-                        "act": sr.get("act", ""),
-                        "scene": sr.get("scene", ""),
-                        "content": sr.get("content", ""),
-                        "key_actions": _split_comma(sr.get("key_actions", "")),
-                        "key_dialogue": sr.get("key_dialogue", ""),
-                        "estimated_duration": float(sr.get("estimated_duration", 0) or 0),
-                        "emotion": sr.get("emotion", ""),
-                        "pace": sr.get("pace", ""),
-                        "gender_state": sr.get("gender_state", ""),
-                        "gender_transition": sr.get("gender_transition", ""),
-                    })
-
-                updated_beats = []
-                for br in beat_rows:
-                    beat_id = br.get("beat_id", "")
-                    beat = {
-                        "act": br.get("act", ""),
-                        "scene": br.get("scene", ""),
-                        "beat_id": beat_id,
-                        "location": br.get("location", ""),
-                        "time": br.get("time", ""),
-                        "content": br.get("content", ""),
-                        "emotion": br.get("emotion", ""),
-                        "key_actions": _split_comma(br.get("key_actions", "")),
-                        "key_dialogue": br.get("key_dialogue", ""),
-                        "gender_state": br.get("gender_state", ""),
-                        "gender_transition": br.get("gender_transition", ""),
-                        "estimated_duration": float(br.get("estimated_duration", 0) or 0),
-                        "pace": br.get("pace", ""),
-                        "emotion_intensity": float(br.get("emotion_intensity", 0) or 0),
-                        "priority": int(br.get("priority", 3) or 3),
-                        "required_shots_count": int(br.get("required_shots_count", 1) or 1),
-                    }
-                    beat["sub_beats"] = sub_beat_map.get(beat_id, [])
-                    # 保留原有 dialogue_entries，避免被覆盖
-                    for old_beat in data.get("beats", []):
-                        if old_beat.get("beat_id") == beat_id and "dialogue_entries" in old_beat:
-                            beat["dialogue_entries"] = old_beat["dialogue_entries"]
-                            break
-                    updated_beats.append(beat)
-
-                data["beats"] = updated_beats
-                with open(analysis_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-
-                # 同步更新 workspace/script.md
-                script_path = os.path.join(SESSION.work_dir, "script.md")
-                if SESSION.work_dir and os.path.exists(SESSION.work_dir):
-                    try:
-                        _save_beats_to_script_md(updated_beats, script_path)
-                    except Exception as e:
-                        logger.warning(f"更新 script.md 失败: {e}")
-
-                return (
-                    f"已保存 {len(updated_beats)} 个剧本节点和 {len(sub_rows)} 个分镜点。\n"
-                    f"script_beats_analysis.json: {analysis_path}\n"
-                    f"script.md: {script_path if SESSION.work_dir else '未找到工作区'}"
-                )
-            except Exception as e:
-                return f"保存失败: {e}\n{traceback.format_exc()}"
-
-        def _save_beats_to_script_md(beats: List[Dict[str, Any]], script_path: str):
-            """把 beat/sub-beat 数据写回标准 Markdown 大纲"""
-            lines = ["# 剧本大纲", ""]
-
-            # 按 act 分组
-            acts: Dict[str, List[Dict[str, Any]]] = {}
-            for b in beats:
-                act = b.get("act") or "未分幕"
-                acts.setdefault(act, []).append(b)
-
-            for act, act_beats in acts.items():
-                lines.append(f"## {act}")
-                lines.append("")
-                for b in act_beats:
-                    beat_id = b.get("beat_id") or f"{b.get('scene', '场')}-情节点"
-                    lines.append(f"### {beat_id}")
-                    lines.append(f"- 地点：{b.get('location', '')}")
-                    lines.append(f"- 时间：{b.get('time', '')}")
-                    lines.append(f"- 内容：{b.get('content', '')}")
-                    lines.append(f"- 情绪：{b.get('emotion', '')}")
-                    actions = b.get("key_actions", [])
-                    if isinstance(actions, str):
-                        actions = [a.strip() for a in actions.split(",") if a.strip()]
-                    lines.append(f"- 关键动作：{'，'.join(actions)}")
-                    lines.append(f"- 关键台词：\"{b.get('key_dialogue', '')}\"")
-                    if b.get("gender_state"):
-                        lines.append(f"- 性别状态：{b.get('gender_state')}")
-                    if b.get("gender_transition"):
-                        lines.append(f"- 状态切换：{b.get('gender_transition')}")
-                    lines.append(f"- 建议时长：{b.get('estimated_duration', '')}")
-                    lines.append(f"- 节奏：{b.get('pace', '')}")
-                    lines.append(f"- 优先级：{b.get('priority', '')}")
-                    lines.append(f"- 情绪强度：{b.get('emotion_intensity', '')}")
-
-                    # sub-beat
-                    for sb in b.get("sub_beats", []):
-                        lines.append(f"#### {sb.get('sub_beat_id', '')}")
-                        lines.append(f"  - 内容：{sb.get('content', '')}")
-                        lines.append(f"  - 情绪：{sb.get('emotion', '')}")
-                        sb_actions = sb.get("key_actions", [])
-                        if isinstance(sb_actions, str):
-                            sb_actions = [a.strip() for a in sb_actions.split(",") if a.strip()]
-                        lines.append(f"  - 关键动作：{'，'.join(sb_actions)}")
-                        lines.append(f"  - 关键台词：\"{sb.get('key_dialogue', '')}\"")
-                        lines.append(f"  - 建议时长：{sb.get('estimated_duration', '')}")
-                        if sb.get("gender_state"):
-                            lines.append(f"  - 性别状态：{sb.get('gender_state')}")
-                        if sb.get("gender_transition"):
-                            lines.append(f"  - 状态切换：{sb.get('gender_transition')}")
-                    lines.append("")
-
-            with open(script_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines).strip() + "\n")
-
-        refresh_phase2_btn.click(
-            fn=refresh_phase2_review,
-            inputs=[],
-            outputs=[beats_df, sub_beat_df, beats_review_box, beat_ref_box, phase2_status],
-        )
-        save_phase2_btn.click(
-            fn=save_phase2_beats,
-            inputs=[beats_df, sub_beat_df],
-            outputs=[phase2_status],
-        )
-
-        # ------------------------------------------------------------------
-        # Phase 3 审核面板函数
-        # ------------------------------------------------------------------
-        def refresh_phase3_review():
-            if not SESSION.output_dir or not os.path.exists(SESSION.output_dir):
-                return pd.DataFrame(), pd.DataFrame(), "尚未运行 Phase 3，无输出文件"
-
-            dedup_path = os.path.join(SESSION.output_dir, "phase2_deduplication.csv")
-            dedup_df = _load_csv_if_exists(dedup_path)
-
-            csv_path = os.path.join(SESSION.output_dir, "phase2_anchor_corrections.csv")
-            if not os.path.exists(csv_path):
-                try:
-                    export_anchor_corrections(SESSION.output_dir, csv_path)
-                except Exception as e:
-                    return dedup_df, pd.DataFrame(), f"导出锚定校正表失败: {e}"
-            anchor_df = _load_csv_if_exists(csv_path)
-
-            status = (
-                f"已加载 Phase 3 筛选表。"
-                f"去重/选择行数: {len(dedup_df)}, 锚定校正行数: {len(anchor_df)}。"
-                f"可在下方「锚定校正表」中修改 corrected_* 列，然后点击「应用锚定校正」。"
-            )
-            return dedup_df, anchor_df, status
-
-        def export_anchor_corrections_ui():
-            if not SESSION.output_dir or not os.path.exists(SESSION.output_dir):
-                return pd.DataFrame(), "尚未运行 Phase 3，无法导出"
-            csv_path = os.path.join(SESSION.output_dir, "phase2_anchor_corrections.csv")
-            try:
-                export_anchor_corrections(SESSION.output_dir, csv_path)
-                anchor_df = _load_csv_if_exists(csv_path)
-                return anchor_df, f"已导出锚定校正表: {csv_path}"
-            except Exception as e:
-                return pd.DataFrame(), f"导出失败: {e}"
-
-        def apply_anchor_corrections_ui(df):
-            if not SESSION.output_dir or not os.path.exists(SESSION.output_dir):
-                return "尚未运行 Phase 3，无法应用"
-            if df is None or df.empty:
-                return "表格为空，未做任何修改"
-            csv_path = os.path.join(SESSION.output_dir, "phase2_anchor_corrections.csv")
-            try:
-                # 把 DataFrame 写回 CSV，保留原列顺序
-                df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-                apply_anchor_corrections(SESSION.output_dir, csv_path)
-                return f"锚定校正已应用并保存至 phase2_selected_shots.json。建议重新运行 Phase 4 查看效果。"
-            except Exception as e:
-                return f"应用失败: {e}\n{traceback.format_exc()}"
-
-        refresh_phase3_btn.click(
-            fn=refresh_phase3_review,
-            inputs=[],
-            outputs=[dedup_df, anchor_df, phase3_status],
-        )
-        export_anchor_btn.click(
-            fn=export_anchor_corrections_ui,
-            inputs=[],
-            outputs=[anchor_df, phase3_status],
-        )
-        apply_anchor_btn.click(
-            fn=apply_anchor_corrections_ui,
-            inputs=[anchor_df],
-            outputs=[phase3_status],
-        )
-
-        # ------------------------------------------------------------------
-        # Phase 4 导出面板函数
-        # ------------------------------------------------------------------
-        def _format_file_size(size_bytes: int) -> str:
-            if size_bytes < 1024:
-                return f"{size_bytes} B"
-            if size_bytes < 1024 * 1024:
-                return f"{size_bytes / 1024:.1f} KB"
-            if size_bytes < 1024 * 1024 * 1024:
-                return f"{size_bytes / (1024 * 1024):.1f} MB"
-            return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
-
-        def _human_time(timestamp: float) -> str:
-            try:
-                return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
-            except Exception:
-                return ""
-
-        def _load_edit_decision_df():
-            """加载 phase3_edit_decision.json 为剪辑决策时间线表格。"""
-            path = os.path.join(SESSION.output_dir, "phase3_edit_decision.json")
-            if not os.path.exists(path):
-                return pd.DataFrame()
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                decisions = data.get("timeline", [])
-                if not decisions:
-                    return pd.DataFrame()
-                columns = [
-                    "sequence", "shot_id", "source_file", "tc_in", "tc_out",
-                    "speed", "technique", "transition", "audio", "purpose",
-                    "beat_id", "sub_beat_id", "duration_sec", "notes",
-                ]
-                rows = []
-                for d in decisions:
-                    rows.append({col: d.get(col, "") for col in columns})
-                return pd.DataFrame(rows)
-            except Exception as e:
-                logger.warning(f"加载 phase3_edit_decision.json 失败: {e}")
-                return pd.DataFrame()
-
-        def _load_final_timeline_df():
-            """加载 timeline.json 为最终成片时间线表格。"""
-            path = os.path.join(SESSION.output_dir, "timeline.json")
-            if not os.path.exists(path):
-                return pd.DataFrame()
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                timeline = data.get("timeline", [])
-                if not timeline:
-                    return pd.DataFrame()
-                columns = [
-                    "sequence", "shot_id", "source_file", "source_in", "source_out",
-                    "timeline_in", "timeline_out", "speed", "technique",
-                    "transition", "audio", "purpose", "notes",
-                ]
-                rows = []
-                for d in timeline:
-                    rows.append({col: d.get(col, "") for col in columns})
-                return pd.DataFrame(rows)
-            except Exception as e:
-                logger.warning(f"加载 timeline.json 失败: {e}")
-                return pd.DataFrame()
-
-        def _build_phase4_summary(data: dict) -> str:
-            total = data.get("total_clips", len(data.get("timeline", [])))
-            target = data.get("target_duration", "-")
-            export_time = data.get("export_time", "-")
-            if export_time and export_time != "-":
-                try:
-                    export_time = export_time[:19].replace("T", " ")
-                except Exception:
-                    pass
-            total_duration = 0.0
-            for d in data.get("timeline", []):
-                try:
-                    timeline_in = d.get("timeline_in", "00:00:00:00")
-                    timeline_out = d.get("timeline_out", "00:00:00:00")
-                    total_duration += _tc_to_sec(timeline_out) - _tc_to_sec(timeline_in)
-                except Exception:
-                    pass
+        def on_confirm_change():
+            SESSION.force_edit_view = True
             return (
-                f"共 {total} 个镜头 | 目标时长 {target} | 成片总时长 {_sec_to_tc(total_duration)} | "
-                f"导出时间 {export_time}"
+                gr.update(visible=False),
+                gr.update(visible=True),
+                gr.update(visible=False),
             )
 
-        def _tc_to_sec(tc: str) -> float:
-            """把 HH:MM:SS:FF 或 HH:MM:SS.SSS 转成秒。"""
+        confirm_yes.click(
+            fn=on_confirm_change,
+            outputs=[confirm_modal, script_edit_view, script_review_view],
+        )
+        confirm_no.click(fn=lambda: gr.update(visible=False), outputs=[confirm_modal])
+
+        # ---------------- ③ 镜头筛选 ----------------
+        def on_run3():
+            msg = start_step_run("3")
+            SESSION.status_msgs["match"] = msg
+            return (msg, *_btns_state(not SESSION.running))
+
+        run3.click(fn=on_run3, outputs=[match_status, run1, run2, run3, run4])
+
+        def on_save3(df):
+            msg = save_anchor_assignment(df)
+            SESSION.status_msgs["match"] = msg
+            vals = _refresh_values()
+            return msg, vals["beats_shots"], vals["assign"]
+
+        save3.click(fn=on_save3, inputs=[assign_df], outputs=[match_status, beats_shots_df, assign_df])
+
+        # ---------------- ④ 剪辑导出 ----------------
+        def on_run4():
+            msg = start_step_run("4")
+            SESSION.status_msgs["export"] = msg
+            return (msg, *_btns_state(not SESSION.running))
+
+        run4.click(fn=on_run4, outputs=[export_status, run1, run2, run3, run4])
+
+        product_pick.change(
+            fn=lambda name: _output_path(name) if name else None,
+            inputs=[product_pick],
+            outputs=[product_file],
+        )
+
+        def on_pick_used(name):
+            if not name:
+                return None
+            for n, p in load_used_materials():
+                if n == name:
+                    return p
+            return None
+
+        used_pick.change(fn=on_pick_used, inputs=[used_pick], outputs=[used_file])
+
+        # ---------------- 弹窗 ----------------
+        for btn, modal_box in [
+            (config_close, config_modal),
+            (key_close, apikey_modal),
+            (log_close, log_modal),
+            (resource_close, resource_modal),
+            (confirm_close, confirm_modal),
+        ]:
+            btn.click(fn=lambda m=modal_box: gr.update(visible=False), outputs=[modal_box])
+
+        def open_config():
+            text = _read_text(_workspace_path("config.yaml")) or DEFAULT_CONFIG
+            return gr.update(visible=True), text
+
+        btn_config.click(fn=open_config, outputs=[config_modal, config_editor])
+
+        def save_config(text):
             try:
-                parts = str(tc).replace(";", ":").split(":")
-                if len(parts) == 4:
-                    h, m, s, f = parts
-                    return int(h) * 3600 + int(m) * 60 + int(s) + int(f) / 24.0
-                if len(parts) == 3:
-                    h, m, s = parts
-                    return int(h) * 3600 + int(m) * 60 + float(s)
-            except Exception:
-                pass
-            return 0.0
-
-        def _sec_to_tc(sec: float) -> str:
-            """秒转 HH:MM:SS。"""
+                yaml.safe_load(text)
+            except Exception as e:
+                return f"配置格式错误: {e}"
             try:
-                h = int(sec // 3600)
-                m = int((sec % 3600) // 60)
-                s = int(sec % 60)
-                return f"{h:02d}:{m:02d}:{s:02d}"
-            except Exception:
-                return "00:00:00"
+                with open(_workspace_path("config.yaml"), "w", encoding="utf-8") as f:
+                    f.write(text)
+                return "已保存到 workspace/config.yaml"
+            except Exception as e:
+                return f"保存失败: {e}"
 
-        def refresh_phase4_exports():
-            if not SESSION.output_dir or not os.path.exists(SESSION.output_dir):
-                return (
-                    pd.DataFrame(),
-                    pd.DataFrame(),
-                    pd.DataFrame(),
-                    None,
-                    None,
-                    "",
-                    "尚未运行 Phase 4，无输出文件",
-                )
+        config_save.click(fn=save_config, inputs=[config_editor], outputs=[config_msg])
 
-            # 剪辑决策时间线
-            decision_df = _load_edit_decision_df()
+        btn_apikey.click(
+            fn=lambda: (gr.update(visible=True), SESSION.vlm_key, SESSION.llm_key),
+            outputs=[apikey_modal, vlm_key_input, llm_key_input],
+        )
 
-            # 最终成片时间线
-            final_df = _load_final_timeline_df()
+        def save_keys(v, l):
+            SESSION.vlm_key = (v or "").strip()
+            SESSION.llm_key = (l or "").strip()
+            ok = []
+            if SESSION.vlm_key:
+                ok.append("VLM ✓")
+            if SESSION.llm_key:
+                ok.append("LLM ✓")
+            return "已保存: " + ("、".join(ok) if ok else "（为空，将使用配置/环境变量中的 Key）")
 
-            # 产物列表
-            phase4_files = [
-                ("成片视频", "final_with_dubbing.mp4"),
-                ("混音音频", "mixed_audio.wav"),
-                ("EDL 时间线", "timeline.edl"),
-                ("FCPXML 时间线", "timeline.fcpxml"),
-                ("CSV 时间线", "timeline_final.csv"),
-                ("配音信息", "dub_info.json"),
+        key_save.click(fn=save_keys, inputs=[vlm_key_input, llm_key_input], outputs=[key_msg])
+
+        btn_log.click(
+            fn=lambda: (gr.update(visible=True), "\n".join(SESSION.log)),
+            outputs=[log_modal, log_code],
+        )
+
+        def open_resource():
+            md, df = load_resource_library()
+            return gr.update(visible=True), md, df
+
+        btn_resource.click(fn=open_resource, outputs=[resource_modal, resource_md, resource_df])
+
+        def on_save_resource(df):
+            msg = save_resource_edits(df)
+            vals = _refresh_values()
+            return msg, vals["materials"]
+
+        resource_save.click(
+            fn=on_save_resource,
+            inputs=[resource_df],
+            outputs=[resource_msg, materials_df],
+        )
+
+        # ---------------- 初始加载 ----------------
+        def on_load():
+            vals = _refresh_values()
+            script_editor_v = _read_text(_workspace_path("script.md")) or DEFAULT_SCRIPT
+            return [
+                vals["st1"], vals["st2"], vals["st3"], vals["st4"],
+                vals["beats_df"], vals["sub_df"], vals["beats_ro"], vals["sub_ro"],
+                vals["beats_md"], vals["edit_vis"], vals["review_vis"],
+                vals["beats_shots"], vals["beats_ro4"], vals["materials"], vals["assign"],
+                vals["video"], vals["export_summary"], vals["products"],
+                vals["product_choices"], vals["used_choices"], vals["used_md"],
+                progress_html, script_editor_v,
+                read_target_duration() or None,
             ]
 
-            rows = []
-            video_path = ""
-            audio_path = ""
-            first_existing = ""
-            for label, filename in phase4_files:
-                file_path = os.path.join(SESSION.output_dir, filename)
-                exists = os.path.exists(file_path)
-                size = os.path.getsize(file_path) if exists else 0
-                mtime = os.path.getmtime(file_path) if exists else 0
-                rows.append({
-                    "产物": label,
-                    "文件名": filename,
-                    "状态": "已生成" if exists else "未生成",
-                    "大小": _format_file_size(size) if exists else "-",
-                    "生成时间": _human_time(mtime) if exists else "-",
-                    "路径": file_path if exists else "",
-                })
-                if exists and not first_existing:
-                    first_existing = file_path
-                if filename == "final_with_dubbing.mp4" and exists:
-                    video_path = file_path
-                if filename == "mixed_audio.wav" and exists:
-                    audio_path = file_path
-
-            files_df = pd.DataFrame(rows)
-
-            # 决策概览
-            timeline_path = os.path.join(SESSION.output_dir, "timeline.json")
-            summary = ""
-            if os.path.exists(timeline_path):
-                try:
-                    with open(timeline_path, "r", encoding="utf-8") as f:
-                        timeline_data = json.load(f)
-                    summary = _build_phase4_summary(timeline_data)
-                except Exception as e:
-                    logger.warning(f"生成 Phase 4 概览失败: {e}")
-
-            status = f"已扫描 Phase 4 导出产物，已生成 {sum(1 for r in rows if r['状态'] == '已生成')}/{len(rows)} 项。"
-
-            return (
-                decision_df,
-                final_df,
-                files_df,
-                video_path if video_path else None,
-                audio_path if audio_path else None,
-                summary,
-                status,
-            )
-
-        refresh_phase4_btn.click(
-            fn=refresh_phase4_exports,
-            inputs=[],
+        demo.load(
+            fn=on_load,
             outputs=[
-                phase4_timeline_df,
-                phase4_final_timeline_df,
-                phase4_files_df,
-                phase4_video_preview,
-                phase4_audio_preview,
-                phase4_summary,
-                phase4_status,
+                st1, st2, st3, st4,
+                beats_df, sub_beat_df, beats_ro_df, sub_beat_ro_df,
+                beats_md, script_edit_view, script_review_view,
+                beats_shots_df, beats_ro4_df, materials_df, assign_df,
+                final_video, export_summary, products_df,
+                product_pick, used_pick, used_md,
+                progress_html, script_editor,
+                target_dur,
             ],
-        )
-        open_output_btn2.click(
-            fn=open_directory,
-            inputs=[gr.Textbox(value="output", visible=False)],
-            outputs=[phase4_status],
         )
 
     return demo
@@ -1478,19 +1831,16 @@ def build_ui() -> gr.Blocks:
 
 def main():
     parser = argparse.ArgumentParser(description="LLM-AutoCut Web UI")
-    parser.add_argument("--config", default=None, help="预加载的配置文件路径")
+    parser.add_argument("--config", default=None, help="预加载配置文件路径")
     parser.add_argument("--port", type=int, default=7860, help="监听端口")
     parser.add_argument("--share", action="store_true", help="生成公开分享链接")
     args = parser.parse_args()
 
-    # 如果指定了配置文件，读取并替换默认配置
-    initial_config = DEFAULT_CONFIG
-    if args.config and os.path.exists(args.config):
-        with open(args.config, "r", encoding="utf-8") as f:
-            initial_config = f.read()
-
     demo = build_ui()
-    demo.queue().launch(server_name="0.0.0.0", server_port=args.port, share=args.share, max_threads=5)
+    demo.queue().launch(
+        server_name="0.0.0.0", server_port=args.port, share=args.share,
+        css=CUSTOM_CSS, theme=gr.themes.Soft(),
+    )
 
 
 if __name__ == "__main__":

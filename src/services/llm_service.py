@@ -8,6 +8,7 @@ LLM（大语言模型）服务层
 """
 import json
 import os
+import re
 from typing import List, Dict, Any, Optional, Set
 
 from src.models import Shot, ScriptBeat
@@ -216,6 +217,157 @@ class LLMService:
 
         return result
 
+    def rebuild_beats(
+        self,
+        script_beats: List[ScriptBeat],
+        total_duration: float,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """基于当前台本重新生成完整情节点列表（含结构划分）。
+
+        与 analyze_script_beats（只富化时长/节奏，不改结构）不同，本方法允许 LLM
+        重新拆分/合并/新增节点，但必须遵守用户在台本中的标记：
+        - 带「锁定」的 beat 必须原样保留（内容不得改写），且每个独占一个节点
+        - 内容为空的分节点（用户用「一键分镜头」插入）必须保留，并由 AI 依据上下文补全内容
+        返回完整 beat dict 列表；失败、结构无效或锁定节点缺失时返回 None（调用方回退原结构）。
+        """
+        if not script_beats or total_duration <= 0:
+            return None
+
+        def _beat_text(b: ScriptBeat) -> str:
+            if b.locked and not (b.content or "").strip():
+                flag = "[锁定·待补全]"
+                body = "（内容为空，请依据上下文补全此节点）"
+            elif b.locked:
+                flag = "[锁定]"
+                body = (
+                    f"地点: {b.location} | 时间: {b.time}\n"
+                    f"内容: {b.content}\n"
+                    f"情绪: {b.emotion}\n"
+                    f"关键动作: {', '.join(b.key_actions)}\n"
+                    f"关键台词: {b.key_dialogue or '无'}"
+                )
+            else:
+                flag = ""
+                body = (
+                    f"地点: {b.location} | 时间: {b.time}\n"
+                    f"内容: {b.content}\n"
+                    f"情绪: {b.emotion}\n"
+                    f"关键动作: {', '.join(b.key_actions)}\n"
+                    f"关键台词: {b.key_dialogue or '无'}"
+                )
+            return f"【{b.beat_id}】{flag}\n{body}"
+
+        beats_text = "\n\n".join(_beat_text(b) for b in script_beats)
+
+        prompt = (
+            "你是一位资深短片编剧兼剪辑指导。用户已有一版情节点划分（见下），"
+            "其中部分节点带有用户标记。请重新整理为最终的情节点列表。\n\n"
+            f"总目标时长: {total_duration:.1f} 秒\n\n"
+            "## 当前情节点（含用户标记）\n"
+            f"{beats_text}\n\n"
+            "## 标记含义与硬性规则\n"
+            "1. [锁定]：用户指定的节点，必须原样出现在输出中，content/关键台词 一字不得改写，"
+            "每个锁定节点独占一个输出元素，不得与其他节点合并。\n"
+            "2. [锁定·待补全]：用户用拆分工具插入的空节点，必须保留，"
+            "请依据上下文为它补写 内容/关键动作/关键台词（对应原文中紧邻的剧情）。\n"
+            "3. 未标记节点：允许合并、拆分、改写或新增；剧情时间顺序不得打乱。\n"
+            "4. 用户特意圈出的剧情（锁定节点）通常是高光/关键转折，优先保证其时长充足。\n\n"
+            "## 输出要求\n"
+            "输出完整 JSON 数组（每个元素一个情节点，顺序即剧情顺序）：\n"
+            '[{"beat_id": "场1-情节点A", "act": "第一幕", "scene": "场1", '
+            '"location": "...", "time": "...", "content": "...", '
+            '"emotion": "...", "key_actions": ["..."], "key_dialogue": "...", '
+            '"estimated_duration": 8.5, "pace": "正常", "priority": 3, '
+            '"required_shots_count": 1, "locked": false}]\n\n'
+            "要求：\n"
+            "- beat_id 优先沿用输入中的 id；新建节点用「场N-情节点X」形式且不得与已有 id 重复。\n"
+            "- locked 字段：锁定/待补全节点为 true，其余 false。\n"
+            "- estimated_duration 之和必须接近总目标时长（误差<10%）。\n"
+            "- pace 只能选 爆发/快/正常/慢/静止 之一；priority 1-5；required_shots_count 建议 1-3。\n"
+            "- 只输出 JSON 数组，不要其他内容。"
+        )
+
+        try:
+            content = self._call(prompt)
+            raw = self._extract_json(content)
+        except Exception as e:
+            logger.error(f"LLM 重建情节点失败: {e}")
+            return None
+        if isinstance(raw, dict):
+            raw = raw.get("beats") or raw.get("timeline") or (
+                list(raw.values()) if raw and all(isinstance(v, dict) for v in raw.values()) else None
+            )
+        if not isinstance(raw, list) or not raw:
+            logger.warning(f"LLM 重建情节点返回无效: {str(raw)[:200]}")
+            return None
+
+        # 解析并校验
+        locked_map = {b.beat_id: b for b in script_beats if b.locked}
+        rebuilt: List[Dict[str, Any]] = []
+        seen_ids = set()
+        try:
+            for item in raw:
+                if not isinstance(item, dict):
+                    return None
+                bid = str(item.get("beat_id", "")).strip()
+                if not bid:
+                    return None
+                if bid in seen_ids:  # id 冲突时自动改名，避免互相覆盖
+                    k = 2
+                    while f"{bid}-{k}" in seen_ids:
+                        k += 1
+                    bid = f"{bid}-{k}"
+                seen_ids.add(bid)
+                key_actions = item.get("key_actions") or []
+                if isinstance(key_actions, str):
+                    key_actions = [a.strip() for a in re.split(r"[，、,]", key_actions) if a.strip()]
+                rebuilt.append({
+                    "act": str(item.get("act", "")),
+                    "scene": str(item.get("scene", "")),
+                    "beat_id": bid,
+                    "location": str(item.get("location", "")),
+                    "time": str(item.get("time", "")),
+                    "content": str(item.get("content", "")),
+                    "emotion": str(item.get("emotion", "")),
+                    "key_actions": key_actions,
+                    "key_dialogue": str(item.get("key_dialogue", "")),
+                    "estimated_duration": float(item.get("estimated_duration", 0.0) or 0.0),
+                    "pace": str(item.get("pace", "正常")),
+                    "priority": int(item.get("priority", 3) or 3),
+                    "required_shots_count": int(item.get("required_shots_count", 1) or 1),
+                    "locked": bool(item.get("locked", False)),
+                })
+        except Exception as e:
+            logger.warning(f"解析重建结果失败: {e}")
+            return None
+
+        # 校验：所有锁定节点必须存在；内容不得被改写
+        out_map = {b["beat_id"]: b for b in rebuilt}
+        for bid, orig in locked_map.items():
+            if bid not in out_map:
+                logger.warning(f"LLM 重建结果丢失了锁定节点 {bid}，放弃重建结果")
+                return None
+            if (orig.content or "").strip():
+                out_map[bid]["content"] = orig.content
+                out_map[bid]["key_dialogue"] = orig.key_dialogue
+                if orig.key_actions:
+                    out_map[bid]["key_actions"] = list(orig.key_actions)
+                out_map[bid]["locked"] = True
+
+        # 总时长归一化到目标
+        total_est = sum(b["estimated_duration"] for b in rebuilt)
+        if total_est <= 0:
+            n = len(rebuilt)
+            for b in rebuilt:
+                b["estimated_duration"] = total_duration / max(n, 1)
+        elif abs(total_est - total_duration) > total_duration * 0.05:
+            ratio = total_duration / total_est
+            for b in rebuilt:
+                b["estimated_duration"] = round(b["estimated_duration"] * ratio, 1)
+
+        logger.info(f"LLM 重建情节点完成: {len(locked_map)} 个锁定保留，共 {len(rebuilt)} 个节点")
+        return rebuilt
+
     @staticmethod
     def _shot_config_text(shot: Shot) -> str:
         """从 Shot 和 shot_config 中提取用于 LLM 匹配的文本描述"""
@@ -319,16 +471,6 @@ class LLMService:
         anchor_map = {}
         shot_map = {s.shot_id: s for s in shots}
 
-        # 来源文件名白名单：根据素材文件名前缀，限制可匹配的情节点范围
-        # 收紧规则：C招聘 只匹配 C2（小六画外音/云琛反应），B紧身 只匹配 C1/C2
-        source_beat_whitelist = {
-            "A追逐": {"场1-情节点A1", "场1-情节点A2"},
-            "B变身": {"场1-情节点A2", "场1-情节点B", "场1-情节点C2"},
-            "B紧身": {"场1-情节点C1", "场1-情节点C2"},
-            "C招聘": {"场1-情节点C2", "场1-情节点D", "场1-情节点E"},
-            "D小六": {"场1-情节点D", "场1-情节点E", "场1-情节点F", "场1-情节点G"},
-        }
-
         batch_size = 10  # 减小批次，降低模型混淆概率
         for batch_start in range(0, len(shots), batch_size):
             batch = shots[batch_start:batch_start + batch_size]
@@ -383,7 +525,7 @@ class LLMService:
                         "reasoning": "",
                     }
 
-        # 后处理：过滤低置信度、非法 beat 和来源文件名白名单
+        # 后处理：过滤低置信度和非法 beat
         valid_beats = {b.beat_id for b in script_beats}
         confidence_threshold = self.config.get("phase2", {}).get("anchor_confidence_threshold", 0.7)
         for shot_id, anchor in list(anchor_map.items()):
@@ -398,23 +540,107 @@ class LLMService:
                 anchor["beat"] = "UNMATCHED"
                 anchor["reasoning"] = (anchor.get("reasoning", "") + f" [后处理：置信度 {conf:.2f} 过低]").strip()
 
-            # 来源文件名白名单校验（仅对成功匹配的 beat 做兜底）
-            shot = shot_map.get(shot_id)
-            if shot and beat in valid_beats:
-                source_file = shot.source_file or ""
-                for prefix, allowed in source_beat_whitelist.items():
-                    if prefix in source_file:
-                        if beat not in allowed:
-                            logger.warning(
-                                f" shot {shot_id} 来源文件 '{source_file}' 与 beat '{beat}' 不匹配，"
-                                f"根据白名单只允许 {allowed}，强制设为 UNMATCHED"
-                            )
-                            anchor["beat"] = "UNMATCHED"
-                            anchor["reasoning"] = (
-                                anchor.get("reasoning", "") + f" [后处理：来源文件 {source_file} 不在 {allowed} 白名单内]"
-                            ).strip()
-                        break
-
             anchor_map[shot_id] = anchor
 
         return anchor_map
+
+    # ------------------------------------------------------------------
+    # 逐节点候选精排（Phase 3 竞争式匹配）
+    # ------------------------------------------------------------------
+    def rank_candidates_for_beat(
+        self,
+        beat: "ScriptBeat",
+        candidates: List[Shot],
+    ) -> Dict[str, Dict[str, Any]]:
+        """对单个情节点，评估候选池中每个镜头与该节点的剧情匹配度。
+
+        返回: shot_id -> {"match_score": 0-1, "reasoning": str}
+        调用失败或无有效返回时返回空 dict（由调用方按缺失处理）。
+        """
+        if not candidates:
+            return {}
+
+        beats_text = (
+            f"【{beat.beat_id}】\n"
+            f"地点: {beat.location} | 时间: {beat.time}\n"
+            f"内容: {beat.content}\n"
+            f"情绪: {beat.emotion}\n"
+            f"关键动作: {', '.join(beat.key_actions) or '无'}\n"
+            f"关键台词: {beat.key_dialogue or '无'}\n"
+            f"性别状态: {beat.gender_state or '无特殊要求'}\n"
+            f"状态转换: {beat.gender_transition or '无'}\n"
+            f"目标时长: {beat.estimated_duration:.1f}s | 建议镜头数: {beat.required_shots_count}"
+        )
+
+        def _brief(shot: Shot) -> str:
+            cfg = (shot.cv_metadata or {}).get("shot_config", {})
+            summary = cfg.get("content_summary") or shot.action or "未知"
+            action = cfg.get("action_details") or shot.action_details or ""
+            line = shot.asr_text or shot.dialogue or cfg.get("dialogue") or ""
+            return (
+                f"- {shot.shot_id} | 时长{shot.duration_sec:.1f}s | {cfg.get('shot_type') or shot.shot_size} | "
+                f"{summary}"
+                + (f" | 动作细节: {action}" if action else "")
+                + (f" | 情绪: {shot.emotion}" if shot.emotion else "")
+                + (f" | 台词: {line}" if line else "")
+            )
+
+        candidates_text = "\n".join(_brief(s) for s in candidates)
+
+        prompt = (
+            "你是一位资深剪辑指导。请评估每个候选镜头与下面剧本情节点的匹配程度。\n\n"
+            "## 剧本情节点\n"
+            f"{beats_text}\n\n"
+            "## 候选镜头\n"
+            f"{candidates_text}\n\n"
+            "## 评分标准\n"
+            "match_score 取值 0.0-1.0：\n"
+            "1.0 = 镜头内容完全对应该情节点剧情（动作/主体/情绪/台词高度吻合）\n"
+            "0.7-0.9 = 主要剧情吻合，部分细节缺失\n"
+            "0.4-0.6 = 部分相关（同场景/同角色，可勉强衔接）\n"
+            "0.1-0.3 = 基本无关\n"
+            "0.0 = 完全无关\n\n"
+            "## 任务\n"
+            "对每个候选镜头输出 match_score 和一句简短理由。\n"
+            "严格输出 JSON 数组（每个候选一条，shot_id 必须与原样一致）：\n"
+            '[{"shot_id": "S001", "match_score": 0.85, "reasoning": "..."}]\n'
+            "只输出 JSON，不要其他内容。"
+        )
+
+        try:
+            content = self._call(prompt)
+            raw = self._extract_json(content)
+        except Exception as e:
+            logger.error(f"LLM 候选精排失败 ({beat.beat_id}): {e}")
+            return {}
+
+        if isinstance(raw, dict):
+            for key in ("results", "rankings", "scores", "data"):
+                if key in raw and isinstance(raw[key], list):
+                    raw = raw[key]
+                    break
+            else:
+                raw = [raw] if "shot_id" in raw else []
+        if not isinstance(raw, list):
+            logger.warning(f"LLM 候选精排返回无法解析 ({beat.beat_id}): {str(raw)[:200]}")
+            return {}
+
+        result = {}
+        valid_ids = {s.shot_id for s in candidates}
+        for i, item in enumerate(raw):
+            if not isinstance(item, dict):
+                continue
+            shot_id = item.get("shot_id") or item.get("id")
+            if not shot_id and i < len(candidates):
+                shot_id = candidates[i].shot_id
+            if shot_id not in valid_ids:
+                continue
+            try:
+                score = float(item.get("match_score", item.get("score", 0.0)) or 0.0)
+            except (TypeError, ValueError):
+                score = 0.0
+            result[shot_id] = {
+                "match_score": max(0.0, min(1.0, score)),
+                "reasoning": str(item.get("reasoning", item.get("reason", ""))),
+            }
+        return result

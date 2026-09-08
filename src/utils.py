@@ -345,6 +345,9 @@ def _split_gender_transition_beats(beats: List[ScriptBeat]) -> List[ScriptBeat]:
     仅对已知结构（场1-情节点A~G）且包含变身/换装关键词的剧本生效。
     """
     beat_ids = [b.beat_id for b in beats]
+    # 用户在台本中加了锁定/手动节点 = 用户已接管结构，不再做自动拆分
+    if any(b.locked for b in beats):
+        return beats
     # 只处理标准 7-beat 结构
     expected = ["场1-情节点A", "场1-情节点B", "场1-情节点C", "场1-情节点D",
                 "场1-情节点E", "场1-情节点F", "场1-情节点G"]
@@ -527,6 +530,7 @@ def parse_script_outline(script_path: str) -> List[ScriptBeat]:
                 key_dialogue=props.get("关键台词", props.get("dialogue", "")),
                 gender_state=props.get("性别状态", props.get("gender_state", "")),
                 gender_transition=props.get("状态切换", props.get("gender_transition", "")),
+                locked=("锁定" in props.get("标记", "") or "强制保留" in props.get("标记", "")),
             )
             beats.append(beat)
             i = j

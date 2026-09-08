@@ -36,21 +36,32 @@ class QualityScorer:
             shot: 待评分镜头
             context: 可选上下文（上一个已选镜头、目标段落时长）
         """
-        w = self.weights
-
-        # 1. 剧情匹配度 (0-1)
         script_match = self._script_match_score(shot)
+        return self.score_with_script_match(shot, script_match, context)
 
-        # 2. 视觉质量 (0-1)
+    def score_with_script_match(
+        self,
+        shot: Shot,
+        script_match: float,
+        context: Optional["ScoreContext"] = None,
+    ) -> float:
+        """用外部给定的剧情匹配分（如 LLM 逐节点精排结果）计算综合质量分 (0-10)。
+
+        script_match 取值 0-1，其余维度（画质/连贯/时长适配/元数据）本地计算。
+        """
+        w = self.weights
+        script_match = max(0.0, min(1.0, float(script_match or 0.0)))
+
+        # 视觉质量 (0-1)
         visual_q = self._visual_quality_score(shot)
 
-        # 3. 叙事连贯 (0-1)
+        # 叙事连贯 (0-1)
         narrative = self._narrative_coherence_score(shot, context)
 
-        # 4. 时长适配 (0-1)
+        # 时长适配 (0-1)
         duration_fit = self._duration_fit_score(shot, context)
 
-        # 5. 元数据完整度 (0-1)
+        # 元数据完整度 (0-1)
         metadata_complete = self._metadata_completeness(shot)
 
         score = (
