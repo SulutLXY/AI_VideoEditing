@@ -243,6 +243,13 @@ def fallback_vlm_to_local(config: Dict[str, Any]) -> bool:
     vision_cfg.setdefault("load_in_4bit", True)
     vision_cfg.setdefault("max_new_tokens", 512)
     vision_cfg.setdefault("keyframe_count", 3)
+    # 多图联合分析（v0.5）：>1s 镜头按 interval 抽帧，注入剧本/参考图
+    vision_cfg.setdefault("frame_interval", 0.5)
+    vision_cfg.setdefault("max_frames", 16)
+    vision_cfg.setdefault("use_script_context", True)
+    vision_cfg.setdefault("use_reference_images", True)
+    vision_cfg.setdefault("script_max_chars", 1500)
+    vision_cfg.setdefault("max_ref_images", 8)
 
     vlm_cfg["provider"] = "local"
     vlm_cfg["model"] = vision_cfg["model_id"]

@@ -451,6 +451,7 @@ class Phase2TakeSelector:
                 "total_score": c["score"],
                 "planned_speed": c["speed"],
                 "planned_duration": c["planned_duration"],
+                "seq": len(selection["core"]),  # 节点内选中顺序（0=主镜头，其后为衔接镜）
             }
             pool.remove(shot)
             prev_shot = shot

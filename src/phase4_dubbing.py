@@ -18,7 +18,7 @@ Phase 4 扩展：配音配乐合成
 """
 import os
 import json
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 
 from src.models import Shot, ScriptBeat, DialogueEntry
@@ -262,106 +262,118 @@ class Phase4Dubbing:
         voice_cast: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
         """
-        将每个 beat 的 dialogue_entries 映射到绝对时间轴，并计算所需语速。
+        将每个 beat 的 dialogue_entries 逐个分配到镜头，映射到绝对时间轴。
 
-        策略：
-        - beat 内对白总时长 D，视频时长 B。
-        - 若 D <= B：按 1x 顺序播放，剩余时间作为间隙。
-        - 若 D > B：需要加速，目标语速 s = clamp(D / B, 1.0, max_speed)。
-          若 D / B > max_speed，则音频会溢出到下一个 beat（允许）。
+        分配规则（B1 镜头级对齐）：
+        - 每条台词开始时间对齐所属镜头的 start_time；同镜头多条台词依次连排
+          （后一条开始 = 前一条的计划结束点）。
+        - window_end = 下一条台词的开始时间；最后一条 = 成片总时长。
+          超时处理在 dubber 侧基于实测音频时长压缩（atempo），不硬裁。
+        - 台词数 > 镜头数时，多余台词挂到该 beat 最后一个镜头依次连排；
+          台词数 < 镜头数时，剩余镜头自然静音。
         """
-        # 计算每个 beat 在成片时间轴上的起止时间
-        beat_time_ranges: Dict[str, Dict[str, float]] = {}
-        for item in timeline:
+        if not timeline:
+            return []
+        video_total = max(it.get("end_time", 0.0) for it in timeline)
+
+        # 按时间线顺序收集每个 beat 的镜头（保持出现顺序）
+        shots_by_beat: Dict[str, List[Tuple[int, Dict[str, Any]]]] = {}
+        beat_order: List[str] = []
+        for tidx, item in enumerate(timeline):
             bid = item.get("beat_id", "")
             if not bid or bid == "UNMATCHED":
                 continue
-            if bid not in beat_time_ranges:
-                beat_time_ranges[bid] = {"start": item["start_time"], "end": item["end_time"]}
-            else:
-                beat_time_ranges[bid]["start"] = min(beat_time_ranges[bid]["start"], item["start_time"])
-                beat_time_ranges[bid]["end"] = max(beat_time_ranges[bid]["end"], item["end_time"])
+            if bid not in shots_by_beat:
+                shots_by_beat[bid] = []
+                beat_order.append(bid)
+            shots_by_beat[bid].append((tidx, item))
 
-        segments = []
-        for beat_id, time_range in sorted(beat_time_ranges.items(), key=lambda x: x[1]["start"]):
-            beat = beat_map.get(beat_id)
+        segments: List[Dict[str, Any]] = []
+        for bid in beat_order:
+            beat = beat_map.get(bid)
             if not beat:
                 continue
-            entries = getattr(beat, "dialogue_entries", []) or []
+            entries = [e for e in (getattr(beat, "dialogue_entries", None) or []) if e.text]
             if not entries:
                 continue
 
-            beat_start = time_range["start"]
-            beat_end = time_range["end"]
+            items = shots_by_beat[bid]
+            beat_start = min(it["start_time"] for _, it in items)
+            beat_end = max(it["end_time"] for _, it in items)
             beat_duration = beat_end - beat_start
             if beat_duration <= 0:
                 continue
 
-            total_dialogue_1x = sum(e.estimated_duration for e in entries)
-            if total_dialogue_1x <= 0:
+            total_1x = sum(e.estimated_duration for e in entries)
+            if total_1x <= 0:
                 continue
 
-            # 计算 beat 内统一目标语速
-            required_speed = total_dialogue_1x / beat_duration
+            # beat 内统一语速提示（Edge TTS rate 参数，实际超时压缩在 dubber 实测后处理）
+            required_speed = total_1x / beat_duration
             if required_speed <= 1.0:
                 target_speed = 1.0
-            elif required_speed <= self.max_speed:
-                target_speed = required_speed
             else:
-                target_speed = self.max_speed
-
+                target_speed = min(required_speed, self.max_speed)
             overflow = required_speed > self.max_speed
             if overflow:
                 logger.info(
-                    f"[Phase4] beat {beat_id} 对白 {total_dialogue_1x:.1f}s 超出视频 "
+                    f"[Phase4] beat {bid} 对白 {total_1x:.1f}s 超出视频 "
                     f"{beat_duration:.1f}s，将以 {self.max_speed}x 语速溢出"
                 )
-
-            # Edge TTS rate 字符串
             if abs(target_speed - 1.0) < 0.05:
                 rate_str = "+0%"
             else:
-                rate_pct = int(round((target_speed - 1.0) * 100))
-                rate_str = f"+{rate_pct}%"
+                rate_str = f"+{int(round((target_speed - 1.0) * 100))}%"
 
-            cursor = beat_start
+            # 顺序分配台词到镜头：多余台词挂最后一个镜头
+            n_shots = len(items)
             for idx, entry in enumerate(entries):
-                if not entry.text:
-                    continue
-
-                # 本条对白的起始时间
-                entry_start = cursor
-                actual_audio_duration = entry.estimated_duration / target_speed if target_speed > 0 else entry.estimated_duration
-
-                voice_id = self._resolve_voice_id(entry.target_voice_role, voice_cast)
-
-                seg = {
-                    "id": f"{beat_id}_d{idx:02d}",
+                tidx, item = items[min(idx, n_shots - 1)]
+                segments.append({
+                    "id": f"{bid}_d{idx:02d}",
                     "text": entry.text,
                     "speaker": entry.speaker,
                     "emotion": entry.emotion or beat.emotion,
-                    "start": round(entry_start, 3),
-                    "end": round(entry_start + actual_audio_duration, 3),
-                    "beat_id": beat_id,
+                    "beat_id": bid,
                     "beat_start": beat_start,
                     "beat_end": beat_end,
-                    "voice_id": voice_id,
+                    "voice_id": self._resolve_voice_id(entry.target_voice_role, voice_cast),
                     "rate": rate_str,
                     "target_speed": round(target_speed, 2),
                     "estimated_duration_1x": entry.estimated_duration,
                     "overflow": overflow,
-                }
-                segments.append(seg)
+                    "_tidx": tidx,
+                    "_idx": idx,
+                    "_shot_start": item["start_time"],
+                })
 
-                cursor = entry_start + actual_audio_duration
+        # 按镜头顺序 + 镜头内序号排序，确定绝对开始时间
+        segments.sort(key=lambda s: (s["_tidx"], s["_idx"]))
+        last_end_in_shot: Dict[int, float] = {}
+        for seg in segments:
+            tkey = seg["_tidx"]
+            start = seg["_shot_start"] if tkey not in last_end_in_shot else last_end_in_shot[tkey]
+            planned = (
+                seg["estimated_duration_1x"] / seg["target_speed"]
+                if seg["target_speed"] > 0 else seg["estimated_duration_1x"]
+            )
+            seg["start"] = round(start, 3)
+            seg["end"] = round(start + planned, 3)
+            last_end_in_shot[tkey] = seg["end"]
 
-        logger.info(f"[Phase4] 生成 {len(segments)} 条对白段落")
+        # window_end：下一条台词的开始；最后一条 = 成片总时长
+        for i, seg in enumerate(segments):
+            seg["window_end"] = segments[i + 1]["start"] if i + 1 < len(segments) else round(video_total, 3)
+        for seg in segments:
+            del seg["_tidx"], seg["_idx"], seg["_shot_start"]
+
+        logger.info(f"[Phase4] 生成 {len(segments)} 条对白段落（镜头级对齐）")
         for seg in segments:
             overflow_note = " [溢出]" if seg.get("overflow") else ""
             logger.info(
-                f"[Phase4]   {seg['id']}: t={seg['start']:.2f}s~{seg['end']:.2f}s, "
-                f"speed={seg['target_speed']:.2f}x, voice={seg['voice_id']}, "
-                f"text={seg['text'][:24]!r}{overflow_note}"
+                f"[Phase4]   {seg['id']}: t={seg['start']:.2f}s~{seg['end']:.2f}s "
+                f"(窗口至 {seg['window_end']:.2f}s), speed={seg['target_speed']:.2f}x, "
+                f"voice={seg['voice_id']}, text={seg['text'][:24]!r}{overflow_note}"
             )
 
         return segments

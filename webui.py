@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -102,6 +103,21 @@ script_preprocessing:
   output_shot_requirements: true
 
 models:
+  local:
+    enabled: true
+    device: "cuda"
+    cache_dir: "./models/local"
+    vision:
+      model_id: "Qwen/Qwen2.5-VL-3B-Instruct"
+      load_in_4bit: true
+      max_new_tokens: 512
+      keyframe_count: 3
+      frame_interval: 0.5
+      max_frames: 16
+      use_script_context: true
+      use_reference_images: true
+      script_max_chars: 1500
+      max_ref_images: 8
   vlm:
     provider: doubao
     model: doubao-seed-2-0-pro-260215
@@ -770,7 +786,8 @@ def save_beats(df_beats: pd.DataFrame, df_sub: pd.DataFrame) -> str:
         sub_map: Dict[str, List[Dict[str, Any]]] = {}
         old_subs = {sb.get("sub_beat_id", ""):
                     sb for b in data.get("beats", []) for sb in b.get("sub_beats", [])}
-        if df_sub is not None and not df_sub.empty:
+        has_sub_edit = df_sub is not None and not df_sub.empty
+        if has_sub_edit:
             for _, sr in df_sub.iterrows():
                 sb_id = str(sr.get("分镜点", "")).strip()
                 parent = str(sr.get("所属情节点", "")).strip()
@@ -807,7 +824,7 @@ def save_beats(df_beats: pd.DataFrame, df_sub: pd.DataFrame) -> str:
                 "estimated_duration": float(br.get("目标时长s", 0) or 0),
                 "pace": br.get("节奏", ""),
             }
-            beat["sub_beats"] = sub_map.get(beat_id, [])
+            beat["sub_beats"] = sub_map.get(beat_id, []) if has_sub_edit else old.get("sub_beats", [])
             for keep in ["dialogue_entries", "gender_state", "gender_transition",
                          "emotion_intensity", "priority", "required_shots_count", "locked"]:
                 if keep in old:
@@ -824,7 +841,7 @@ def save_beats(df_beats: pd.DataFrame, df_sub: pd.DataFrame) -> str:
         except Exception as e:
             logger.warning(f"更新 script.md 失败: {e}")
 
-        return f"已保存 {len(updated)} 个剧本节点的修改"
+        return f"已保存 {len(updated)} 个节点（时长/内容按你的修改原样生效，未走 AI 分配）"
     except Exception as e:
         return f"保存失败: {e}\n{traceback.format_exc()}"
 
@@ -1138,6 +1155,145 @@ def save_resource_edits(df: pd.DataFrame) -> str:
 
 
 # ----------------------------------------------------------------------
+# 角色参考图管理（workspace/refs + refs.json 清单）
+# 清单条目: {"file": "相对文件名", "name": "角色名", "description": "说明"}
+# 说明文字会注入本地 VLM 的 prompt，帮助角色对照分析。
+# ----------------------------------------------------------------------
+
+REFS_MANIFEST_NAME = "refs.json"
+_IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def _refs_dir() -> str:
+    path = _workspace_path("refs")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _refs_manifest_path() -> str:
+    return os.path.join(_refs_dir(), REFS_MANIFEST_NAME)
+
+
+def load_refs_entries() -> List[Dict[str, Any]]:
+    """读取参考图清单；无清单时回退扫描 refs/ 目录（子目录=角色名 或 角色名_角度.jpg）。"""
+    entries: List[Dict[str, Any]] = []
+    manifest = _refs_manifest_path()
+    if os.path.exists(manifest):
+        try:
+            with open(manifest, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for e in data.get("images", []):
+                file_name = str(e.get("file", "")).strip()
+                if not file_name:
+                    continue
+                if not os.path.exists(os.path.join(_refs_dir(), file_name)):
+                    continue
+                entries.append({
+                    "file": file_name,
+                    "name": str(e.get("name", "")).strip(),
+                    "description": str(e.get("description", "")).strip(),
+                })
+            return entries
+        except Exception as e:
+            logger.warning(f"读取参考图清单失败，回退目录扫描: {e}")
+
+    base = _refs_dir()
+    try:
+        for entry in sorted(os.listdir(base)):
+            full = os.path.join(base, entry)
+            if os.path.isdir(full):
+                for f in sorted(os.listdir(full)):
+                    if f.lower().endswith(_IMG_EXTS):
+                        entries.append({"file": os.path.join(entry, f), "name": entry, "description": ""})
+            elif entry.lower().endswith(_IMG_EXTS) and entry != REFS_MANIFEST_NAME:
+                stem = os.path.splitext(entry)[0]
+                entries.append({"file": entry, "name": stem.split("_")[0], "description": ""})
+    except Exception as e:
+        logger.warning(f"扫描参考图目录失败: {e}")
+    return entries
+
+
+def save_refs_entries(entries: List[Dict[str, Any]]):
+    with open(_refs_manifest_path(), "w", encoding="utf-8") as f:
+        json.dump({"version": 1, "images": entries}, f, ensure_ascii=False, indent=2)
+
+
+def load_refs_ui() -> Tuple[List, pd.DataFrame, str]:
+    """参考图弹窗内容：画廊值、可编辑表格、说明文字"""
+    entries = load_refs_entries()
+    gallery, rows = [], []
+    for i, e in enumerate(entries):
+        full = os.path.join(_refs_dir(), e["file"])
+        caption = e["name"] or os.path.basename(e["file"])
+        if e["description"]:
+            caption += "｜" + (e["description"][:36] + ("…" if len(e["description"]) > 36 else ""))
+        gallery.append((full, f"#{i + 1} {caption}"))
+        rows.append({"序号": i + 1, "文件": e["file"], "角色名": e["name"], "说明": e["description"]})
+    md = (
+        f"已有 {len(entries)} 张参考图。点击画廊中的图可选中（用于删除）；"
+        "在下方表格修改「角色名 / 说明」后点保存。说明会注入 Phase 1 VLM 分析 prompt。"
+    )
+    return gallery, pd.DataFrame(rows), md
+
+
+def add_ref_image(file_path: str, name: str, description: str) -> str:
+    """新增参考图：拷贝文件到 workspace/refs 并写入清单"""
+    if not file_path or not os.path.exists(file_path):
+        return "请先选择图片文件"
+    name = (name or "").strip()
+    if not name:
+        return "请填写角色名"
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in _IMG_EXTS:
+        return f"不支持的图片格式: {ext}"
+    # 先读清单再拷贝文件，避免无清单时目录扫描把刚拷贝的文件当成旧条目
+    entries = load_refs_entries()
+    base = _refs_dir()
+    stem = re.sub(r'[\\/:*?"<>|\s]+', "_", name)
+    file_name, n = f"{stem}{ext}", 1
+    while os.path.exists(os.path.join(base, file_name)):
+        n += 1
+        file_name = f"{stem}_{n}{ext}"
+    try:
+        shutil.copy2(file_path, os.path.join(base, file_name))
+    except Exception as e:
+        return f"图片拷贝失败: {e}"
+    entries.append({"file": file_name, "name": name, "description": (description or "").strip()})
+    save_refs_entries(entries)
+    return f"已新增参考图 #{len(entries)}：{name}"
+
+
+def save_refs_edits(df: pd.DataFrame) -> str:
+    """把弹窗表格里的「角色名 / 说明」按行序写回清单（不支持增删行，增删用专门按钮）"""
+    entries = load_refs_entries()
+    if df is None or df.empty:
+        return "参考图表为空，未保存"
+    if len(df) != len(entries):
+        return f"行数不一致（表 {len(df)} 行 / 清单 {len(entries)} 条），请在表格中撤销增删行后重试"
+    for (_, row), e in zip(df.iterrows(), entries):
+        e["name"] = str(row.get("角色名", "") or "").strip()
+        e["description"] = str(row.get("说明", "") or "").strip()
+    save_refs_entries(entries)
+    return f"已保存 {len(entries)} 条参考图信息"
+
+
+def delete_ref_image(index: int) -> str:
+    """按序号删除参考图（清单条目 + 物理文件）"""
+    entries = load_refs_entries()
+    if not (0 <= index < len(entries)):
+        return f"无效的序号：{index + 1}（共 {len(entries)} 张）"
+    e = entries.pop(index)
+    try:
+        full = os.path.join(_refs_dir(), e["file"])
+        if os.path.exists(full):
+            os.remove(full)
+    except Exception as ex:
+        return f"清单已更新，但删除文件失败: {ex}"
+    save_refs_entries(entries)
+    return f"已删除 #{index + 1}：{e['name'] or e['file']}（剩余 {len(entries)} 张）"
+
+
+# ----------------------------------------------------------------------
 # UI
 # ----------------------------------------------------------------------
 
@@ -1157,6 +1313,8 @@ CUSTOM_CSS = """
     box-shadow: 0 12px 40px rgba(0,0,0,.25); }
 .modal-close { margin-left: auto; }
 .gr-dataframe td { white-space: normal !important; word-break: break-word; }
+#beats-review-table { min-height: 560px; }
+#beats-review-table td:nth-child(8), #beats-review-table th:nth-child(8) { white-space: nowrap !important; }
 """
 
 from contextlib import contextmanager
@@ -1201,6 +1359,7 @@ def build_ui():
         with gr.Row():
             gr.Markdown("## 🎬 LLM-AutoCut 智能剪辑工作台", scale=4)
             btn_config = gr.Button("📄 配置", scale=0, min_width=80)
+            btn_refs = gr.Button("🖼 参考图", scale=0, min_width=90)
             btn_apikey = gr.Button("🔑 API Key", scale=0, min_width=90)
             btn_log = gr.Button("📋 日志", scale=0, min_width=80, elem_classes="log-fab")
 
@@ -1281,32 +1440,15 @@ def build_ui():
                             split_btn = gr.Button("✂️ 在此拆分镜头节点", variant="secondary", scale=0)
                         split_msg = gr.Markdown("")
 
-                    # 审核态：左右分屏，左侧可改右侧只读
+                    # 审核态：可编辑节点表（全宽）
                     with gr.Column(visible=False) as script_review_view:
                         beats_md = gr.Markdown("")
-                        with gr.Row():
-                            with gr.Column(scale=1):
-                                beats_df = gr.DataFrame(
-                                    label="剧本审核节点（左侧 · 可编辑）",
-                                    interactive=True, wrap=True,
-                                    column_widths={"内容": "230px", "关键动作": "180px", "关键台词": "230px"},
-                                )
-                                sub_beat_df = gr.DataFrame(
-                                    label="分镜点（可编辑）",
-                                    interactive=True, wrap=True,
-                                    column_widths={"内容": "230px", "关键动作": "180px", "关键台词": "230px"},
-                                )
-                            with gr.Column(scale=1):
-                                beats_ro_df = gr.DataFrame(
-                                    label="剧本节点表（右侧 · 只读）",
-                                    interactive=False, wrap=True,
-                                    column_widths={"内容": "230px", "关键动作": "180px", "关键台词": "230px"},
-                                )
-                                sub_beat_ro_df = gr.DataFrame(
-                                    label="分镜点表（只读）",
-                                    interactive=False, wrap=True,
-                                    column_widths={"内容": "230px", "关键动作": "180px", "关键台词": "230px"},
-                                )
+                        beats_df = gr.DataFrame(
+                            label="剧本审核节点（可编辑 · 改完点上方「保存修改」直接生效，不走 AI）",
+                            interactive=True, wrap=True, elem_id="beats-review-table",
+                            max_height=620,
+                            column_widths=[110, 130, 130, 350, 130, 150, 350, 95, 60, 65],
+                        )
 
                 # ===== ③ 镜头筛选 =====
                 with gr.Column(visible=False) as panel3:
@@ -1319,18 +1461,18 @@ def build_ui():
                             beats_shots_df = gr.DataFrame(
                                 label="剧本节点表（左侧 · 含镜头栏）",
                                 interactive=False, wrap=True,
-                                column_widths={"内容": "230px", "对白": "180px"},
+                                column_widths=[110, 340, 80, 180, 260, 60],
                             )
                         with gr.Column(scale=1):
                             materials_df = gr.DataFrame(
                                 label="素材表（Phase 1 分析结果）",
                                 interactive=False, wrap=True,
-                                column_widths={"源文件": "160px", "内容摘要": "230px", "动作": "180px"},
+                                column_widths=[70, 160, 60, 60, 80, 230, 180, 60],
                             )
                             assign_df = gr.DataFrame(
                                 label="镜头归属分配（改「归属情节点」列后保存）",
                                 interactive=True, wrap=True,
-                                column_widths={"源文件": "160px", "动作": "180px"},
+                                column_widths=[70, 160, 110, 70],
                             )
 
                 # ===== ④ 剪辑导出 =====
@@ -1342,7 +1484,7 @@ def build_ui():
                         with gr.Column(scale=1):
                             beats_ro4_df = gr.DataFrame(
                                 label="剧本节点表", interactive=False, wrap=True,
-                                column_widths={"内容": "230px", "对白": "180px"},
+                                column_widths=[110, 340, 80, 180, 260, 60],
                             )
                         with gr.Column(scale=2):
                             final_video = gr.Video(label="成片预览")
@@ -1351,7 +1493,7 @@ def build_ui():
                         with gr.Column(scale=1):
                             products_df = gr.DataFrame(
                                 label="导出产物（可单独下载）", interactive=False, wrap=True,
-                                column_widths={"文件名": "230px"},
+                                column_widths=[260],
                             )
                             product_pick = gr.Dropdown(label="选择产物下载", choices=[], interactive=True)
                             product_file = gr.File(label="产物文件")
@@ -1381,11 +1523,41 @@ def build_ui():
             resource_md = gr.Markdown("")
             resource_df = gr.DataFrame(
                 interactive=True, wrap=True,
-                column_widths={"源文件": "160px", "内容摘要": "230px", "动作": "180px"},
+                column_widths=[70, 200, 160, 60, 60, 230, 180, 60],
             )
             with gr.Row():
                 resource_save = gr.Button("💾 保存修改（内容摘要 / 动作）", variant="primary", scale=0)
                 resource_msg = gr.Markdown("", scale=3)
+
+        with modal("角色参考图管理（注入 Phase 1 VLM 分析）") as (refs_modal, refs_close):
+            refs_md = gr.Markdown("")
+            refs_gallery = gr.Gallery(
+                label="现有参考图（点击选中）", columns=6, rows=2,
+                object_fit="contain", height="auto",
+            )
+            refs_sel_state = gr.State(-1)
+            refs_df = gr.DataFrame(
+                interactive=True, wrap=True,
+                label="角色名 / 说明（改完点保存）",
+                column_widths=[50, 180, 120, 360],
+            )
+            with gr.Row():
+                refs_save = gr.Button("💾 保存修改（角色名 / 说明）", variant="primary", scale=0)
+                refs_del = gr.Button("🗑 删除选中图", variant="stop", scale=0)
+                refs_msg = gr.Markdown("", scale=3)
+            with gr.Row():
+                refs_upload = gr.File(
+                    file_count="single",
+                    file_types=[".jpg", ".jpeg", ".png", ".webp"],
+                    label="上传新参考图",
+                )
+                refs_name = gr.Textbox(label="角色名", placeholder="例如：云琛-女装", scale=0, min_width=140)
+                refs_desc = gr.Textbox(
+                    label="说明（会注入分析 prompt）",
+                    placeholder="例如：男主换装后的形象，青衫长发，夜戏",
+                    scale=3,
+                )
+                refs_add = gr.Button("➕ 新增", variant="primary", scale=0)
 
         with modal("确认更改剧本？") as (confirm_modal, confirm_close):
             gr.Markdown("已有剧本分析结果会被保留，重新分析后覆盖。确认进入剧本编辑？")
@@ -1476,8 +1648,7 @@ def build_ui():
                 "match_status": SESSION.status_msgs["match"],
                 "export_status": SESSION.status_msgs["export"],
                 "st1": st1_v, "st2": st2_v, "st3": st3_v, "st4": st4_v,
-                "beats_df": beats_df_v, "sub_df": sub_df_v,
-                "beats_ro": beats_df_v, "sub_ro": sub_df_v,
+                "beats_df": beats_df_v,
                 "beats_md": beats_summary,
                 "edit_vis": edit_vis, "review_vis": review_vis,
                 "beats_shots": beats_shots_v,
@@ -1498,7 +1669,7 @@ def build_ui():
             "prep_status", "script_status", "match_status", "export_status",
             # 数据区（仅运行完成时刷新，避免表格/视频闪烁）
             "st1", "st2", "st3", "st4",
-            "beats_df", "sub_df", "beats_ro", "sub_ro", "beats_md",
+            "beats_df", "beats_md",
             "edit_vis", "review_vis",
             "beats_shots", "beats_ro4", "materials", "assign",
             "video", "export_summary", "products", "product_choices", "used_choices", "used_md",
@@ -1509,7 +1680,7 @@ def build_ui():
             progress_html, btn_log, log_code,
             prep_status, script_status, match_status, export_status,
             st1, st2, st3, st4,
-            beats_df, sub_beat_df, beats_ro_df, sub_beat_ro_df, beats_md,
+            beats_df, beats_md,
             script_edit_view, script_review_view,
             beats_shots_df, beats_ro4_df, materials_df, assign_df,
             final_video, export_summary, products_df, product_pick, used_pick, used_md,
@@ -1558,7 +1729,7 @@ def build_ui():
             vals = _refresh_values()
             return vis + [
                 vals["st1"], vals["st2"], vals["st3"], vals["st4"],
-                vals["beats_df"], vals["sub_df"], vals["beats_ro"], vals["sub_ro"],
+                vals["beats_df"],
                 vals["beats_md"], vals["edit_vis"], vals["review_vis"],
                 vals["beats_shots"], vals["beats_ro4"], vals["materials"], vals["assign"],
                 vals["video"], vals["export_summary"], vals["products"],
@@ -1571,7 +1742,7 @@ def build_ui():
             outputs=[
                 panel1, panel2, panel3, panel4,
                 st1, st2, st3, st4,
-                beats_df, sub_beat_df, beats_ro_df, sub_beat_ro_df,
+                beats_df,
                 beats_md, script_edit_view, script_review_view,
                 beats_shots_df, beats_ro4_df, materials_df, assign_df,
                 final_video, export_summary, products_df,
@@ -1604,26 +1775,28 @@ def build_ui():
 
         run2.click(fn=on_run2, outputs=[script_status, run1, run2, run3, run4])
 
-        def on_save2(d, s):
-            msg = save_beats(d, s)
+        def on_save2(d):
+            """直接保存用户手改的节点表（时长/内容原样生效，不走 AI 分配）"""
+            msg = save_beats(d, None)
             SESSION.status_msgs["script"] = msg
-            return msg
+            vals = _refresh_values()
+            return msg, vals["beats_df"], vals["beats_md"]
 
         save2.click(
             fn=on_save2,
-            inputs=[beats_df, sub_beat_df],
-            outputs=[script_status],
+            inputs=[beats_df],
+            outputs=[script_status, beats_df, beats_md],
         )
 
         def on_apply_dur(v):
             msg = apply_target_duration(v)
             vals = _refresh_values()
-            return msg, vals["beats_df"], vals["sub_df"], vals["beats_ro"], vals["sub_ro"], vals["beats_md"]
+            return msg, vals["beats_df"], vals["beats_md"]
 
         apply_dur.click(
             fn=on_apply_dur,
             inputs=[target_dur],
-            outputs=[dur_status, beats_df, sub_beat_df, beats_ro_df, sub_beat_ro_df, beats_md],
+            outputs=[dur_status, beats_df, beats_md],
         )
 
         script_upload.change(
@@ -1734,6 +1907,7 @@ def build_ui():
             (key_close, apikey_modal),
             (log_close, log_modal),
             (resource_close, resource_modal),
+            (refs_close, refs_modal),
             (confirm_close, confirm_modal),
         ]:
             btn.click(fn=lambda m=modal_box: gr.update(visible=False), outputs=[modal_box])
@@ -1797,13 +1971,58 @@ def build_ui():
             outputs=[resource_msg, materials_df],
         )
 
+        # ---------------- 参考图弹窗 ----------------
+        def open_refs():
+            gallery, df, md = load_refs_ui()
+            return gr.update(visible=True), gallery, df, md, -1, ""
+
+        btn_refs.click(
+            fn=open_refs,
+            outputs=[refs_modal, refs_gallery, refs_df, refs_md, refs_sel_state, refs_msg],
+        )
+
+        def on_refs_select(evt: gr.SelectData):
+            idx = evt.index if evt.index is not None else -1
+            return idx, (f"已选中第 {idx + 1} 张，可点「删除选中图」移除" if idx >= 0 else "")
+
+        refs_gallery.select(fn=on_refs_select, outputs=[refs_sel_state, refs_msg])
+
+        def on_refs_add(file, name, desc):
+            msg = add_ref_image(file.name if file is not None else "", name, desc)
+            gallery, df, _ = load_refs_ui()
+            return msg, gallery, df, None, "", ""
+
+        refs_add.click(
+            fn=on_refs_add,
+            inputs=[refs_upload, refs_name, refs_desc],
+            outputs=[refs_msg, refs_gallery, refs_df, refs_upload, refs_name, refs_desc],
+        )
+
+        def on_refs_save(df):
+            msg = save_refs_edits(df)
+            gallery, df_v, _ = load_refs_ui()
+            return msg, gallery, df_v
+
+        refs_save.click(fn=on_refs_save, inputs=[refs_df], outputs=[refs_msg, refs_gallery, refs_df])
+
+        def on_refs_delete(idx):
+            msg = delete_ref_image(int(idx) if idx is not None else -1)
+            gallery, df, _ = load_refs_ui()
+            return msg, gallery, df, -1
+
+        refs_del.click(
+            fn=on_refs_delete,
+            inputs=[refs_sel_state],
+            outputs=[refs_msg, refs_gallery, refs_df, refs_sel_state],
+        )
+
         # ---------------- 初始加载 ----------------
         def on_load():
             vals = _refresh_values()
             script_editor_v = _read_text(_workspace_path("script.md")) or DEFAULT_SCRIPT
             return [
                 vals["st1"], vals["st2"], vals["st3"], vals["st4"],
-                vals["beats_df"], vals["sub_df"], vals["beats_ro"], vals["sub_ro"],
+                vals["beats_df"],
                 vals["beats_md"], vals["edit_vis"], vals["review_vis"],
                 vals["beats_shots"], vals["beats_ro4"], vals["materials"], vals["assign"],
                 vals["video"], vals["export_summary"], vals["products"],
@@ -1816,7 +2035,7 @@ def build_ui():
             fn=on_load,
             outputs=[
                 st1, st2, st3, st4,
-                beats_df, sub_beat_df, beats_ro_df, sub_beat_ro_df,
+                beats_df,
                 beats_md, script_edit_view, script_review_view,
                 beats_shots_df, beats_ro4_df, materials_df, assign_df,
                 final_video, export_summary, products_df,

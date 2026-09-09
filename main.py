@@ -612,25 +612,68 @@ def main():
 
                 phase3_path = args.input_json or os.path.join(output_dir, 'timeline.json')
                 fallback_phase3_path = os.path.join(output_dir, 'phase3_edit_decision.json')
+                # Phase 3 重跑会更新其计划：比镜头结果旧的缓存决策作废，改用 Phase 3 计划执行
+                plan_mtime = os.path.getmtime(phase2_path) if os.path.exists(phase2_path) else 0
+                explicit_input = bool(args.input_json)
 
-                if os.path.exists(phase3_path):
+                def _stale(p: str) -> bool:
+                    return bool(plan_mtime) and not explicit_input and os.path.getmtime(p) < plan_mtime
+
+                if os.path.exists(phase3_path) and not _stale(phase3_path):
                     with open(phase3_path, 'r', encoding='utf-8') as f:
                         timeline_data = json.load(f)
                     decisions = [_load_decision(d) for d in timeline_data.get('timeline', [])]
                     passed = timeline_data.get('passed', False)
                     total_score = timeline_data.get('total_score', 0.0)
                     logger.info(f"从 timeline.json 加载 {len(decisions)} 个剪辑决策")
-                elif os.path.exists(fallback_phase3_path):
+                elif os.path.exists(fallback_phase3_path) and not _stale(fallback_phase3_path):
                     with open(fallback_phase3_path, 'r', encoding='utf-8') as f:
                         decisions = [_load_decision(d) for d in json.load(f).get('timeline', [])]
                     passed = False
                     total_score = 0.0
                     logger.info(f"从 phase3_edit_decision.json 加载 {len(decisions)} 个剪辑决策")
                 else:
-                    # 没有缓存的剪辑决策，现场运行 Phase 3 编辑器
-                    Phase3Editor, _ = _import_phase3_editor()
-                    editor = Phase3Editor(config)
-                    decisions = editor.run(shots)
+                    # 无缓存剪辑决策：优先直接执行 Phase 3 竞争匹配的计划
+                    # （镜头、源区间、变速在 Phase 3 已按用户预算确定，Phase 4 只负责执行）
+                    core_shots = [s for s in shots
+                                  if s.status == "核心" and s.script_anchor
+                                  and s.script_anchor.get("planned_speed")]
+                    if core_shots:
+                        beat_order = {b.beat_id: i for i, b in enumerate(script_beats)} \
+                            if script_beats else {}
+                        core_shots.sort(key=lambda s: (
+                            beat_order.get(s.script_anchor.get("beat", ""), 999),
+                            s.script_anchor.get("seq", 0),
+                            -(s.script_anchor.get("total_score") or 0.0),
+                        ))
+                        decisions = []
+                        for idx, s in enumerate(core_shots, 1):
+                            a = s.script_anchor
+                            decisions.append(EditDecision(
+                                sequence=idx,
+                                shot_id=s.shot_id,
+                                source_file=s.source_file,
+                                tc_in=s.tc_in,
+                                tc_out=s.tc_out,
+                                speed=f"{a['planned_speed']}x",
+                                technique="硬切",
+                                transition="硬切",
+                                audio="保留原声",
+                                purpose="",
+                                notes=f"Phase 3 竞争匹配计划（积分 {a.get('total_score', 0):.2f}）",
+                                beat_id=a.get("beat", ""),
+                                act=a.get("act", ""),
+                                source_path=s.source_path,
+                            ))
+                        logger.info(
+                            f"Phase 4: 直接执行 Phase 3 竞争匹配计划，共 {len(decisions)} 个镜头 "
+                            f"（不再由剪辑决策器重算变速）"
+                        )
+                    else:
+                        # 没有任何 Phase 3 计划（如从 Phase 1 回退加载），现场运行 Phase 3 编辑器
+                        Phase3Editor, _ = _import_phase3_editor()
+                        editor = Phase3Editor(config)
+                        decisions = editor.run(shots)
 
             # Final Gate: 检查 Phase 3 是否通过 VLM 终审
             timeline_json_path = os.path.join(output_dir, 'timeline.json')

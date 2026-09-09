@@ -126,8 +126,19 @@ class VisionEngine:
         return downloaded
 
     @staticmethod
-    def extract_keyframes(video_path: str, count: int = 3) -> List[Tuple[float, Image.Image]]:
-        """提取关键帧 (timestamp_sec, PIL.Image)"""
+    def extract_keyframes(
+        video_path: str,
+        count: int = 3,
+        interval: float = 0.5,
+        max_frames: int = 16,
+    ) -> List[Tuple[float, Image.Image]]:
+        """提取关键帧 (timestamp_sec, PIL.Image)
+
+        自适应策略：
+        - 时长 <= 1s 的短镜头：走原流程，取首/中/尾 count 帧；
+        - 时长 > 1s 的镜头：每 interval 秒抽一帧，超过 max_frames 上限时
+          按上限均匀重采（长时间镜头不再因只抽 3 帧而分析不足）。
+        """
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             return []
@@ -135,20 +146,53 @@ class VisionEngine:
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         duration = total_frames / fps if fps > 0 else 0
 
-        if count >= 3:
-            indices = [0, total_frames // 2, total_frames - 1]
+        if duration <= 1.0 or count <= 1:
+            # 短镜头：原首/中/尾逻辑
+            if count >= 3:
+                indices = [0, total_frames // 2, total_frames - 1]
+            else:
+                step = max(1, total_frames // count)
+                indices = [min(i * step, total_frames - 1) for i in range(count)]
         else:
-            step = max(1, total_frames // count)
-            indices = [min(i * step, total_frames - 1) for i in range(count)]
+            # 长镜头：每 interval 秒一帧
+            step_frames = max(1, int(round(interval * fps)))
+            indices = list(range(0, total_frames, step_frames))
+
+        # 容器元数据可能虚报帧数（如 -c copy 切分的片段），先探测实际可读的最后一帧
+        last_ok = indices[-1]
+        cap.set(cv2.CAP_PROP_POS_FRAMES, last_ok)
+        ret, _ = cap.read()
+        while not ret and last_ok > 0:
+            last_ok = max(0, last_ok - 10)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, last_ok)
+            ret, _ = cap.read()
+
+        # 超上限：在可读范围内均匀重采到 max_frames 帧
+        if len(indices) > max_frames:
+            indices = sorted(set(
+                int(round(i * last_ok / (max_frames - 1)))
+                for i in range(max_frames)
+            ))
+
+        # 索引钳制到可读范围内并去重（避免多帧钳到同一位置）
+        seen_idx = set()
+        indices = [min(i, last_ok) for i in indices if not (min(i, last_ok) in seen_idx or seen_idx.add(min(i, last_ok)))]
 
         frames = []
+        last_ts = -1.0
         for idx in indices:
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ret, frame = cap.read()
-            if ret:
-                timestamp = idx / fps
-                img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                frames.append((round(timestamp, 2), img))
+            if not ret:
+                continue
+            # 用解码器实际位置取时间戳，避免帧数元数据虚报导致的时间漂移
+            msec = cap.get(cv2.CAP_PROP_POS_MSEC)
+            timestamp = msec / 1000.0 if msec and msec > 0 else idx / fps
+            if timestamp <= last_ts:
+                continue
+            last_ts = timestamp
+            img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            frames.append((round(timestamp, 2), img))
         cap.release()
         return frames
 
@@ -180,6 +224,82 @@ class VisionEngine:
             '  "notes": "其他值得注意的信息"\n'
             "}"
         )
+
+    def _build_multi_prompt(
+        self,
+        frame_times: List[float],
+        script_context: Optional[str] = None,
+        ref_entries: Optional[List[Tuple[str, str]]] = None,
+    ) -> str:
+        """多图联合分析 prompt：帧序列（带时间戳）+ 角色参考图（带说明）+ 剧情背景"""
+        ref_entries = ref_entries or []
+        parts = []
+        header = (
+            "你是一位专业的影视镜头内容分析师。接下来会给你若干张图片："
+        )
+        if ref_entries:
+            header += f"前 {len(ref_entries)} 张是角色参考图，"
+        header += f"其余 {len(frame_times)} 张是同一视频片段按时间顺序排列的帧"
+        if len(frame_times) >= 2:
+            header += f"（相邻帧间隔约 {frame_times[1] - frame_times[0]:.2f} 秒）"
+        header += (
+            "。请综合所有帧的时序变化进行分析：注意动作演变、镜头运动方向、情绪转折"
+            + ("，以及画面人物与角色参考图的对应关系" if ref_entries else "")
+            + "。并以 JSON 格式输出以下字段。不要输出任何其他文字，只输出纯 JSON。\n"
+        )
+        parts.append(header)
+
+        if ref_entries:
+            ref_lines = []
+            for i, (name, desc) in enumerate(ref_entries):
+                line = f"图R{i + 1}: 角色「{name}」的参考形象"
+                if desc:
+                    line += f"。说明：{desc}"
+                ref_lines.append(line)
+            parts.append(
+                f"【角色参考图】\n" + "\n".join(ref_lines) + "\n"
+                "若画面中人物与某张参考图是同一人（含换装/易容/不同角度），"
+                "请在 characters 字段中使用该角色名。\n"
+            )
+
+        if script_context:
+            parts.append(
+                f"【剧情背景】\n{script_context}\n"
+                "请结合剧情背景判断画面动作与情绪的剧情含义，而不是只描述表面画面。\n"
+            )
+
+        frame_desc = "\n".join(
+            f"图{i + 1} (t={t:.2f}s)" for i, t in enumerate(frame_times)
+        )
+        parts.append(f"【视频帧】\n{frame_desc}\n")
+
+        parts.append(
+            "{\n"
+            '  "shot_size": "特写/近景/中景/全景/大全景/无法判断",\n'
+            '  "camera_movement": "固定/推/拉/摇/移/跟/手持/变焦/无法判断",\n'
+            '  "camera_position": "机位描述",\n'
+            '  "direction": "人物朝向或运动方向",\n'
+            '  "action": "画面主体主要动作（一句话，结合时序）",\n'
+            '  "action_details": "动作细节与演变：从第一帧到最后一帧的动作变化过程",\n'
+            '  "emotion": "整体情绪（注意帧间情绪转折）",\n'
+            '  "performance": "表演评估：自然度、情绪强度、是否入戏",\n'
+            '  "location": "场景地点",\n'
+            '  "time_of_day": "白天/傍晚/夜晚/室内灯光/无法判断",\n'
+            '  "characters": ["画面中出现的角色名（与参考图对应，无匹配则描述外貌）"],\n'
+            '  "framing": "构图描述",\n'
+            '  "lighting": "光效描述",\n'
+            '  "color_tone": "色调描述",\n'
+            '  "style": "风格标签",\n'
+            '  "atmosphere": "氛围描述",\n'
+            '  "culture": "文化/时代背景",\n'
+            '  "key_objects": ["关键道具1", "关键道具2"],\n'
+            '  "tags": ["标签1", "标签2"],\n'
+            '  "continuity_score": 0.85,\n'
+            '  "continuity_notes": "镜头内部连续性说明：是否一镜到底、有无跳切/穿帮/方向跳变",\n'
+            '  "notes": "其他值得注意的信息"\n'
+            "}"
+        )
+        return "\n".join(parts)
 
     def _parse_response(self, text: str) -> Dict:
         """解析模型返回，优先按 JSON，失败则正则兜底"""
@@ -253,6 +373,7 @@ class VisionEngine:
             "style": "",
             "atmosphere": "",
             "culture": "",
+            "characters": [],
             "key_objects": [],
             "tags": [],
             "continuity_score": 0.0,
@@ -269,8 +390,21 @@ class VisionEngine:
             out["continuity_score"] = 0.0
         return out
 
-    def process_video(self, video_path: str, keyframe_count: int = 3) -> Dict:
-        """处理单个视频片段，返回与 Shot 模型对齐的视觉分析结果"""
+    def process_video(
+        self,
+        video_path: str,
+        keyframe_count: int = 3,
+        frame_interval: float = 0.5,
+        max_frames: int = 16,
+        script_context: Optional[str] = None,
+        ref_images: Optional[List[Tuple[str, "Image.Image"]]] = None,
+    ) -> Dict:
+        """处理单个视频片段，返回与 Shot 模型对齐的视觉分析结果
+
+        - <=1s 短镜头走原首/中/尾抽帧；>1s 镜头每 frame_interval 秒抽一帧（上限 max_frames）
+        - 主路径：全部帧 + 角色参考图一次性多图联合推理（Qwen2.5-VL 原生多图能力）
+        - 兜底：多图推理失败时回退逐帧单图推理 + 投票聚合
+        """
         self.load()
 
         fallback = {
@@ -284,6 +418,7 @@ class VisionEngine:
             "performance": "",
             "location": "",
             "time_of_day": "",
+            "characters": [],
             "framing": "",
             "lighting": "",
             "color_tone": "",
@@ -302,25 +437,83 @@ class VisionEngine:
             print(f"[VisionEngine] Model not available, skipping {os.path.basename(video_path)}")
             return fallback
 
-        keyframes = self.extract_keyframes(video_path, keyframe_count)
+        keyframes = self.extract_keyframes(
+            video_path,
+            count=keyframe_count,
+            interval=frame_interval,
+            max_frames=max_frames,
+        )
         if not keyframes:
             return fallback
 
-        prompt_text = self._build_prompt()
-        all_results = []
-        key_frames_output = []
+        ref_list = ref_images or []
+        # 兼容 (name, img) 与 (name, img, desc) 两种条目
+        ref_entries = [
+            (r[0], r[2] if len(r) > 2 else "") for r in ref_list
+        ]
+        frame_times = [t for t, _ in keyframes]
 
-        for timestamp, image in keyframes:
-            result = self._infer_single(image, prompt_text)
-            all_results.append(result)
-            key_frames_output.append({
-                "timestamp": timestamp,
-                "description": result.get("action", ""),
-            })
+        final: Dict
+        try:
+            all_images = [r[1] for r in ref_list] + [img for _, img in keyframes]
+            prompt_text = self._build_multi_prompt(
+                frame_times,
+                script_context=script_context,
+                ref_entries=ref_entries,
+            )
+            final = self._infer_multi(all_images, prompt_text)
+            final["_inference_mode"] = "multi_image"
+        except Exception as e:
+            print(f"[VisionEngine] 多图推理失败，回退逐帧投票: {e}")
+            prompt_text = self._build_prompt()
+            all_results = [self._infer_single(img, prompt_text) for _, img in keyframes]
+            final = self._vote_aggregate(all_results)
+            final["_inference_mode"] = "per_frame_vote"
 
-        final = self._vote_aggregate(all_results)
-        final["key_frames"] = key_frames_output
+        final["key_frames"] = [
+            {"timestamp": t, "description": final.get("action", "")}
+            for t in frame_times
+        ]
         return final
+
+    def _infer_multi(self, images: List["Image.Image"], prompt_text: str) -> Dict:
+        """多图联合推理（参考图 + 帧序列一次请求）"""
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    [{"type": "image", "image": img} for img in images]
+                    + [{"type": "text", "text": prompt_text}]
+                ),
+            }
+        ]
+
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = self.processor(
+            text=[text],
+            images=images,
+            return_tensors="pt",
+            padding=True,
+        )
+        inputs = inputs.to(self.model.device)
+
+        with torch.no_grad():
+            generated_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+            )
+
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        response = self.processor.batch_decode(
+            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0]
+
+        return self._parse_response(response)
 
     def _infer_single(self, image: Image.Image, prompt_text: str) -> Dict:
         """单张图片推理"""
@@ -414,6 +607,7 @@ class VisionEngine:
             "style": most_common("style"),
             "atmosphere": longest("atmosphere"),
             "culture": most_common("culture"),
+            "characters": union_list("characters"),
             "key_objects": union_list("key_objects"),
             "tags": union_list("tags"),
             "continuity_score": avg_score("continuity_score"),
