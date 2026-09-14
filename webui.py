@@ -120,6 +120,7 @@ models:
       max_ref_images: 8
   vlm:
     provider: doubao
+    allow_online: false           # 在线 VLM 总开关：默认 false 强制本地，true 才允许联网
     model: doubao-seed-2-0-pro-260215
     api_key: ""
     base_url: https://ark.cn-beijing.volces.com/api/v3
@@ -474,7 +475,8 @@ def prepare_workspace_files(raw_files: list, materials_dir: str = "") -> str:
 # 步骤运行引擎（subprocess 隔离 main.py，日志进环形缓冲）
 # ----------------------------------------------------------------------
 
-PHASE_LABELS = {"2": "剧本分析", "3": "镜头筛选", "4": "剪辑导出"}
+PHASE_LABELS = {"0": "素材粗剪", "1": "素材分析", "0+1": "素材分析（Phase 0+1）",
+                "2": "剧本分析", "3": "镜头筛选", "4": "剪辑导出"}
 
 
 def _validate_keys(phase: str, config: dict) -> Optional[str]:
@@ -492,7 +494,7 @@ def _validate_keys(phase: str, config: dict) -> Optional[str]:
         return "错误：未设置 LLM API Key，请点击右上角 🔑 填写。"
     if phase == "3" and not llm_key and not llm_env:
         return "错误：未设置 LLM API Key，请点击右上角 🔑 填写。"
-    if phase in ("0", "1") and not local_vlm and not vlm_key and not vlm_env:
+    if phase in ("0", "1", "0+1") and not local_vlm and not vlm_key and not vlm_env:
         return "错误：未设置 VLM API Key，请点击右上角 🔑 填写。"
     return None
 
@@ -503,8 +505,8 @@ def _subprocess_python() -> str:
     return str(venv_python) if venv_python.exists() else sys.executable
 
 
-def _run_subprocess(phase: str) -> None:
-    """在工作区内运行 main.py --phase N，日志写入 SESSION.log"""
+def _run_single_phase(phase: str) -> int:
+    """在工作区内运行 main.py --phase N（--clean 先清旧产物），日志写入 SESSION.log"""
     config_path = _workspace_path("config.yaml")
     cmd = [
         _subprocess_python(), "main.py",
@@ -513,34 +515,43 @@ def _run_subprocess(phase: str) -> None:
         "--clean",
     ]
     SESSION.log.append(f"[运行] {' '.join(cmd)}")
+    process = subprocess.Popen(
+        cmd,
+        cwd=str(PROJECT_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        universal_newlines=True,
+    )
+    assert process.stdout is not None
+    for line in process.stdout:
+        line = line.rstrip()
+        if not line:
+            continue
+        SESSION.log.append(line)
+        # 提取进度文字：取最近的含阶段/百分比/计数的行
+        if any(k in line for k in ["Phase", "第", "/", "镜头", "片段", "节点", "beat"]):
+            if len(line) <= 80:
+                SESSION.run_label = line.strip()
+    return process.wait()
+
+
+def _run_subprocess(phase: str) -> None:
+    """运行单个阶段或组合阶段（如 "0+1" 先粗剪再分析），日志写入 SESSION.log"""
     try:
-        process = subprocess.Popen(
-            cmd,
-            cwd=str(PROJECT_ROOT),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            universal_newlines=True,
-        )
-        assert process.stdout is not None
-        for line in process.stdout:
-            line = line.rstrip()
-            if not line:
-                continue
-            SESSION.log.append(line)
-            # 提取进度文字：取最近的含阶段/百分比/计数的行
-            if any(k in line for k in ["Phase", "第", "/", "镜头", "片段", "节点", "beat"]):
-                if len(line) <= 80:
-                    SESSION.run_label = line.strip()
-        return_code = process.wait()
-        SESSION.run_ok = (return_code == 0)
+        ok_all = True
+        for ph in phase.split("+"):
+            code = _run_single_phase(ph)
+            if code != 0:
+                ok_all = False
+                SESSION.log.append(f"[失败] {PHASE_LABELS.get(ph, ph)} 退出码 {code}")
+                break
+        SESSION.run_ok = ok_all
         if SESSION.run_ok:
             SESSION.log.append(f"[完成] {PHASE_LABELS.get(phase, phase)} 运行成功")
-        else:
-            SESSION.log.append(f"[失败] 退出码 {return_code}")
     except Exception as e:
         SESSION.run_ok = False
         SESSION.log.append(f"[异常] {e}\n{traceback.format_exc()}")
@@ -574,6 +585,14 @@ def start_step_run(phase: str) -> str:
         return err
 
     # 前置产物检查
+    if phase == "1":
+        rough_dir = _output_path("phase0_rough_clips")
+        has_rough = os.path.isdir(rough_dir) and any(
+            f.lower().endswith((".mp4", ".mov", ".avi", ".mkv", ".webm"))
+            for f in os.listdir(rough_dir)
+        )
+        if not has_rough:
+            return "缺少 Phase 0 粗剪片段，请先运行「▶ 运行素材粗剪（Phase 0）」"
     if phase == "3" and not os.path.exists(_output_path("script_beats_analysis.json")):
         return "缺少剧本分析结果，请先完成「② 剧本分析」"
     if phase == "4" and not (
@@ -706,9 +725,34 @@ def load_split_clip_configs() -> List[Dict[str, Any]]:
 
 
 def load_materials_data() -> pd.DataFrame:
-    """右侧素材表：Phase 1 最终素材表（数据源 phase1_split_clips/Sxxx_config.json）。"""
+    """右侧素材表：Phase 1 最终素材表（数据源 phase1_split_clips/Sxxx_config.json）。
+
+    台词列来自 config.dialogue；音频标签从 phase1_frames/<stem>/audio_profile.json 读取
+    （事件/情绪/声音环境），与资产分析档案一致。
+    """
     rows = []
     for c in load_split_clip_configs():
+        audio_tag = ""
+        kfs = c.get("keyframes") or []
+        if kfs:
+            try:
+                profile_path = os.path.join(
+                    os.path.dirname(kfs[0]), "audio_profile.json"
+                )
+                if os.path.exists(profile_path):
+                    with open(profile_path, encoding="utf-8") as f:
+                        ap = json.load(f)
+                    bits = []
+                    if ap.get("event"):
+                        bits.append(str(ap["event"]))
+                    if ap.get("emotion"):
+                        bits.append(str(ap["emotion"]))
+                    if ap.get("sound_env") and ap["sound_env"] != "speech":
+                        bits.append({"ambient_or_bgm": "BGM/环境音",
+                                     "silent": "静音"}.get(ap["sound_env"], ap["sound_env"]))
+                    audio_tag = "/".join(bits)
+            except Exception:
+                pass
         rows.append({
             "镜头编号": c.get("shot_id", ""),
             "源文件": c.get("source_file", ""),
@@ -718,6 +762,8 @@ def load_materials_data() -> pd.DataFrame:
             "内容摘要": c.get("content_summary", ""),
             "动作": c.get("action", ""),
             "情绪": c.get("emotion", ""),
+            "台词": (c.get("dialogue") or "")[:40],
+            "音频": audio_tag,
         })
     return pd.DataFrame(rows)
 
@@ -1219,8 +1265,25 @@ def save_refs_entries(entries: List[Dict[str, Any]]):
 
 
 def load_refs_ui() -> Tuple[List, pd.DataFrame, str]:
-    """参考图弹窗内容：画廊值、可编辑表格、说明文字"""
+    """参考图弹窗内容：画廊值、可编辑表格、说明文字。
+
+    表格含「AI分析档案」列：来自 ref_profiles.json 的只读展示，保存时被忽略。
+    """
     entries = load_refs_entries()
+
+    profiles: Dict[str, Any] = {}
+    prof_path = os.path.join(_refs_dir(), "ref_profiles.json")
+    if os.path.exists(prof_path):
+        try:
+            with open(prof_path, encoding="utf-8") as f:
+                profiles = json.load(f).get("references", {}) or {}
+        except Exception as e:
+            logger.warning(f"读取参考图档案失败: {e}")
+    try:
+        from src.local_models.ref_profiler import profile_to_desc
+    except Exception:
+        profile_to_desc = None  # type: ignore
+
     gallery, rows = [], []
     for i, e in enumerate(entries):
         full = os.path.join(_refs_dir(), e["file"])
@@ -1228,9 +1291,18 @@ def load_refs_ui() -> Tuple[List, pd.DataFrame, str]:
         if e["description"]:
             caption += "｜" + (e["description"][:36] + ("…" if len(e["description"]) > 36 else ""))
         gallery.append((full, f"#{i + 1} {caption}"))
-        rows.append({"序号": i + 1, "文件": e["file"], "角色名": e["name"], "说明": e["description"]})
+        prof = profiles.get(e["name"]) or {}
+        if profile_to_desc and prof:
+            ai = profile_to_desc(prof)
+            if prof.get("user_note"):
+                ai += f"（备注: {prof['user_note']}）"
+        else:
+            ai = "未分析"
+        rows.append({"序号": i + 1, "文件": e["file"], "角色名": e["name"],
+                     "说明": e["description"], "AI分析档案": ai})
+    analyzed = sum(1 for r in rows if r["AI分析档案"] != "未分析")
     md = (
-        f"已有 {len(entries)} 张参考图。点击画廊中的图可选中（用于删除）；"
+        f"已有 {len(entries)} 张参考图（已分析 {analyzed}）。点击画廊中的图可选中（用于删除）；"
         "在下方表格修改「角色名 / 说明」后点保存。说明会注入 Phase 1 VLM 分析 prompt。"
     )
     return gallery, pd.DataFrame(rows), md
@@ -1389,6 +1461,8 @@ def build_ui():
                 with gr.Column(visible=True) as panel1:
                     with gr.Row():
                         run1 = gr.Button("▶ 准备工作区", variant="primary", scale=0)
+                        run_p0 = gr.Button("▶ 运行素材粗剪（Phase 0）", scale=0)
+                        run_p1 = gr.Button("▶ 运行素材分析（Phase 1）", scale=0)
                         prep_status = gr.Textbox(label="状态", interactive=False, scale=3)
                     with gr.Row():
                         raw_upload = gr.File(
@@ -1512,6 +1586,10 @@ def build_ui():
         with modal("API Key（仅保存在当前会话，运行时注入配置）") as (apikey_modal, key_close):
             vlm_key_input = gr.Textbox(label="VLM Key（豆包 ARK / OpenAI 等）", type="password")
             llm_key_input = gr.Textbox(label="LLM Key（DeepSeek 等）", type="password")
+            allow_online_vlm = gr.Checkbox(
+                label="允许 VLM 使用在线模型（默认仅本地 Qwen2.5-VL 分析，勾选后才联网）",
+                value=False,
+            )
             with gr.Row():
                 key_save = gr.Button("保存", variant="primary")
                 key_msg = gr.Markdown("")
@@ -1538,19 +1616,21 @@ def build_ui():
             refs_sel_state = gr.State(-1)
             refs_df = gr.DataFrame(
                 interactive=True, wrap=True,
-                label="角色名 / 说明（改完点保存）",
-                column_widths=[50, 180, 120, 360],
+                label="角色名 / 说明（改完点保存；AI分析档案列只读）",
+                column_widths=[50, 160, 110, 240, 300],
             )
             with gr.Row():
-                refs_save = gr.Button("💾 保存修改（角色名 / 说明）", variant="primary", scale=0)
-                refs_del = gr.Button("🗑 删除选中图", variant="stop", scale=0)
+                refs_save = gr.Button("💾 保存修改", variant="primary", scale=0, min_width=110)
+                refs_del = gr.Button("🗑 删除选中图", variant="stop", scale=0, min_width=110)
                 refs_msg = gr.Markdown("", scale=3)
             with gr.Row():
-                refs_upload = gr.File(
+                refs_upload = gr.UploadButton(
+                    "📁 选择图片",
                     file_count="single",
                     file_types=[".jpg", ".jpeg", ".png", ".webp"],
-                    label="上传新参考图",
+                    scale=0, min_width=110,
                 )
+                refs_upload_path = gr.State("")
                 refs_name = gr.Textbox(label="角色名", placeholder="例如：云琛-女装", scale=0, min_width=140)
                 refs_desc = gr.Textbox(
                     label="说明（会注入分析 prompt）",
@@ -1558,6 +1638,19 @@ def build_ui():
                     scale=3,
                 )
                 refs_add = gr.Button("➕ 新增", variant="primary", scale=0)
+            refs_res_radio = gr.Radio(
+                ["480p", "720p", "1080p"],
+                value="480p",
+                label="身份识别分辨率（仅影响身份确认调用，内容分析恒为 480p；联网 VLM 可用高分辨率换精度）",
+                scale=1,
+            )
+            with gr.Row():
+                refs_analyze = gr.Button("🔍 分析参考图", variant="primary", scale=0, min_width=120)
+                refs_analyze_force = gr.Checkbox(label="强制重新分析全部", scale=0)
+                refs_analyze_note = gr.Markdown(
+                    "生成关键词档案（类型/性别/身份/特征），供 Phase 1 身份确认调用；未分析的图下次 Phase 1 自动补。",
+                    scale=3,
+                )
 
         with modal("确认更改剧本？") as (confirm_modal, confirm_close):
             gr.Markdown("已有剧本分析结果会被保留，重新分析后覆盖。确认进入剧本编辑？")
@@ -1571,7 +1664,7 @@ def build_ui():
         # 事件绑定
         # ==================================================================
 
-        run_btns = [run1, run2, run3, run4]
+        run_btns = [run_p0, run_p1, run1, run2, run3, run4]
 
         def _btns_state(interactive: bool):
             return [gr.update(interactive=interactive) for _ in run_btns]
@@ -1673,7 +1766,7 @@ def build_ui():
             "edit_vis", "review_vis",
             "beats_shots", "beats_ro4", "materials", "assign",
             "video", "export_summary", "products", "product_choices", "used_choices", "used_md",
-            "b1", "b2", "b3", "b4",
+            "b0", "b1", "b2", "b3", "b4", "b5",
         ]
 
         TICK_COMPONENTS = [
@@ -1684,13 +1777,15 @@ def build_ui():
             script_edit_view, script_review_view,
             beats_shots_df, beats_ro4_df, materials_df, assign_df,
             final_video, export_summary, products_df, product_pick, used_pick, used_md,
-            run1, run2, run3, run4,
+            run_p0, run_p1, run1, run2, run3, run4,
         ]
 
         # 总是刷新区的组件个数（progress/logfab/log_code + 4 个状态）
         TICK_ALWAYS = 7
+        # 按钮区组件个数（run_btns 展开后的尾巴）
+        N_RUN_BTNS = 6
         # 运行完成时，把结果写进步骤状态栏：TICK_KEYS 中的下标
-        TICK_STEP_STATUS_IDX = {"2": 4, "3": 5, "4": 6}
+        TICK_STEP_STATUS_IDX = {"0": 3, "1": 3, "2": 4, "3": 5, "4": 6}
 
         def on_tick():
             full = SESSION.run_done
@@ -1705,18 +1800,18 @@ def build_ui():
                 SESSION.run_step = ""
                 SESSION.log.append(f"[状态] {result_msg}")
             vals = _refresh_values()
-            out = [vals[k] for k in TICK_KEYS[:-4]]  # 末尾 4 项是按钮，由 run_btns 提供
+            out = [vals[k] for k in TICK_KEYS[:-N_RUN_BTNS]]  # 末尾 N 项是按钮，由 run_btns 提供
             if full:
                 idx = TICK_STEP_STATUS_IDX.get(step)
                 if idx is not None:
                     out[idx] = result_msg
-                    status_key = {"2": "script", "3": "match", "4": "export"}.get(step)
+                    status_key = {"0": "prep", "1": "prep", "2": "script", "3": "match", "4": "export"}.get(step)
                     if status_key:
                         SESSION.status_msgs[status_key] = result_msg
             out += vals["run_btns"]
             # 非完成时刻，数据类组件不刷新，避免表格/视频闪烁
             if not full:
-                for i in range(TICK_ALWAYS, len(out) - 4):
+                for i in range(TICK_ALWAYS, len(out) - N_RUN_BTNS):
                     out[i] = gr.update()
             return out
 
@@ -1764,6 +1859,40 @@ def build_ui():
             outputs=[prep_status, prep_summary],
         )
 
+        # ---------------- ① 素材粗剪（Phase 0） ----------------
+        def on_run_p0():
+            if not os.path.exists(_workspace_path("config.yaml")):
+                msg = "错误：请先点击「准备工作区」生成配置"
+                SESSION.status_msgs["prep"] = msg
+                return msg, *_btns_state(True)
+            msg = start_step_run("0")
+            SESSION.status_msgs["prep"] = msg
+            if msg.endswith("已开始运行"):
+                return msg, *_btns_state(False)
+            return msg, *_btns_state(True)
+
+        run_p0.click(
+            fn=on_run_p0,
+            outputs=[prep_status, *run_btns],
+        )
+
+        # ---------------- ① 素材分析（Phase 1） ----------------
+        def on_run_p1():
+            if not os.path.exists(_workspace_path("config.yaml")):
+                msg = "错误：请先点击「准备工作区」生成配置"
+                SESSION.status_msgs["prep"] = msg
+                return msg, *_btns_state(True)
+            msg = start_step_run("1")
+            SESSION.status_msgs["prep"] = msg
+            if msg.endswith("已开始运行"):
+                return msg, *_btns_state(False)
+            return msg, *_btns_state(True)
+
+        run_p1.click(
+            fn=on_run_p1,
+            outputs=[prep_status, *run_btns],
+        )
+
         # ---------------- ② 剧本 ----------------
         def on_run2():
             msg = start_step_run("2")
@@ -1773,7 +1902,7 @@ def build_ui():
                 return msg, *_btns_state(False)
             return msg, *_btns_state(True)
 
-        run2.click(fn=on_run2, outputs=[script_status, run1, run2, run3, run4])
+        run2.click(fn=on_run2, outputs=[script_status, *run_btns])
 
         def on_save2(d):
             """直接保存用户手改的节点表（时长/内容原样生效，不走 AI 分配）"""
@@ -1867,7 +1996,7 @@ def build_ui():
             SESSION.status_msgs["match"] = msg
             return (msg, *_btns_state(not SESSION.running))
 
-        run3.click(fn=on_run3, outputs=[match_status, run1, run2, run3, run4])
+        run3.click(fn=on_run3, outputs=[match_status, *run_btns])
 
         def on_save3(df):
             msg = save_anchor_assignment(df)
@@ -1883,7 +2012,7 @@ def build_ui():
             SESSION.status_msgs["export"] = msg
             return (msg, *_btns_state(not SESSION.running))
 
-        run4.click(fn=on_run4, outputs=[export_status, run1, run2, run3, run4])
+        run4.click(fn=on_run4, outputs=[export_status, *run_btns])
 
         product_pick.change(
             fn=lambda name: _output_path(name) if name else None,
@@ -1932,22 +2061,45 @@ def build_ui():
 
         config_save.click(fn=save_config, inputs=[config_editor], outputs=[config_msg])
 
+        def _read_allow_online() -> bool:
+            try:
+                cfg = load_config(_workspace_path("config.yaml"))
+                return bool(cfg.get("models", {}).get("vlm", {}).get("allow_online", False))
+            except Exception:
+                return False
+
         btn_apikey.click(
-            fn=lambda: (gr.update(visible=True), SESSION.vlm_key, SESSION.llm_key),
-            outputs=[apikey_modal, vlm_key_input, llm_key_input],
+            fn=lambda: (
+                gr.update(visible=True),
+                SESSION.vlm_key, SESSION.llm_key, _read_allow_online(),
+            ),
+            outputs=[apikey_modal, vlm_key_input, llm_key_input, allow_online_vlm],
         )
 
-        def save_keys(v, l):
+        def save_keys(v, l, allow_online):
             SESSION.vlm_key = (v or "").strip()
             SESSION.llm_key = (l or "").strip()
+            # 在线 VLM 开关持久化到 workspace/config.yaml
+            try:
+                cfg = load_config(_workspace_path("config.yaml"))
+                cfg.setdefault("models", {}).setdefault("vlm", {})["allow_online"] = bool(allow_online)
+                with open(_workspace_path("config.yaml"), "w", encoding="utf-8") as f:
+                    yaml.dump(cfg, f, allow_unicode=True, sort_keys=False)
+                switch_note = "已允许在线 VLM" if allow_online else "已切换为仅本地 VLM"
+            except Exception as e:
+                switch_note = f"开关保存失败: {e}"
             ok = []
             if SESSION.vlm_key:
                 ok.append("VLM ✓")
             if SESSION.llm_key:
                 ok.append("LLM ✓")
-            return "已保存: " + ("、".join(ok) if ok else "（为空，将使用配置/环境变量中的 Key）")
+            return "已保存: " + ("、".join(ok) if ok else "（Key 为空，将使用配置/环境变量）") + f"；{switch_note}"
 
-        key_save.click(fn=save_keys, inputs=[vlm_key_input, llm_key_input], outputs=[key_msg])
+        key_save.click(
+            fn=save_keys,
+            inputs=[vlm_key_input, llm_key_input, allow_online_vlm],
+            outputs=[key_msg],
+        )
 
         btn_log.click(
             fn=lambda: (gr.update(visible=True), "\n".join(SESSION.log)),
@@ -1972,13 +2124,84 @@ def build_ui():
         )
 
         # ---------------- 参考图弹窗 ----------------
+        def _read_identity_resolution() -> str:
+            try:
+                cfg = load_config(_workspace_path("config.yaml"))
+                v = cfg.get("models", {}).get("local", {}).get("vision", {}).get("identity_resolution", "480p")
+                return v if v in ("480p", "720p", "1080p") else "480p"
+            except Exception:
+                return "480p"
+
         def open_refs():
             gallery, df, md = load_refs_ui()
-            return gr.update(visible=True), gallery, df, md, -1, ""
+            return gr.update(visible=True), gallery, df, md, -1, "", _read_identity_resolution()
 
         btn_refs.click(
             fn=open_refs,
-            outputs=[refs_modal, refs_gallery, refs_df, refs_md, refs_sel_state, refs_msg],
+            outputs=[refs_modal, refs_gallery, refs_df, refs_md, refs_sel_state, refs_msg, refs_res_radio],
+        )
+
+        def on_refs_resolution_change(res):
+            res = res if res in ("480p", "720p", "1080p") else "480p"
+            try:
+                cfg = load_config(_workspace_path("config.yaml"))
+                cfg.setdefault("models", {}).setdefault("local", {}).setdefault("vision", {})["identity_resolution"] = res
+                with open(_workspace_path("config.yaml"), "w", encoding="utf-8") as f:
+                    yaml.dump(cfg, f, allow_unicode=True, sort_keys=False)
+                return f"身份识别分辨率已保存为 {res}（下次 Phase 1 分析生效）"
+            except Exception as e:
+                return f"分辨率保存失败: {e}"
+
+        refs_res_radio.change(
+            fn=on_refs_resolution_change,
+            inputs=[refs_res_radio],
+            outputs=[refs_msg],
+        )
+
+        def on_refs_analyze(force):
+            if SESSION.running:
+                return "已有任务在运行（Phase 0-4 之一），请等其完成再分析参考图"
+            refs_dir = _refs_dir()
+            if not os.path.isdir(refs_dir):
+                return "错误：参考图目录不存在，请先上传参考图"
+            try:
+                cfg = load_config(_workspace_path("config.yaml"))
+            except Exception as e:
+                return f"错误：读取工作区配置失败: {e}"
+            try:
+                from src.services.local_vlm_service import LocalVLMService
+                from src.local_models.ref_profiler import ensure_ref_profiles, profile_to_desc
+                local = LocalVLMService(cfg)
+                if not local.enabled:
+                    return "错误：本地 VLM 未启用（models.local.enabled=false），无法分析参考图"
+                engine = local._get_engine()
+                try:
+                    engine.load()  # _get_engine 只构造不加载，必须先 load
+                    if getattr(engine, "model", None) is None:
+                        return "错误：本地 VLM 模型加载失败（详情见启动控制台日志），无法分析参考图"
+                    profiles = ensure_ref_profiles(refs_dir, engine, force=bool(force))
+                finally:
+                    try:
+                        engine.unload()
+                    except Exception:
+                        pass
+                if not profiles:
+                    return "未生成任何档案：请确认已上传参考图（refs.json 清单存在）"
+                lines = [f"✅ 已生成 {len(profiles)} 份关键词档案（refs/ref_profiles.json）："]
+                for name, p in profiles.items():
+                    note = p.get("user_note")
+                    lines.append(f"- **{name}**：{profile_to_desc(p)}" + (f"（备注: {note}）" if note else ""))
+                lines.append("")
+                lines.append("下次 Phase 1 身份确认调用将使用以上档案。")
+                return "\n".join(lines)
+            except Exception as e:
+                import traceback
+                return f"分析失败: {e}\n{traceback.format_exc()}"
+
+        refs_analyze.click(
+            fn=on_refs_analyze,
+            inputs=[refs_analyze_force],
+            outputs=[refs_msg],
         )
 
         def on_refs_select(evt: gr.SelectData):
@@ -1987,15 +2210,26 @@ def build_ui():
 
         refs_gallery.select(fn=on_refs_select, outputs=[refs_sel_state, refs_msg])
 
-        def on_refs_add(file, name, desc):
-            msg = add_ref_image(file.name if file is not None else "", name, desc)
+        def on_refs_upload(path):
+            path = path or ""
+            return path, ("已选择图片，填写角色名/说明后点「➕ 新增」" if path else "未选择文件")
+
+        refs_upload.upload(
+            fn=on_refs_upload,
+            outputs=[refs_upload_path, refs_msg],
+        )
+
+        def on_refs_add(path, name, desc):
+            msg = add_ref_image(path or "", name, desc)
             gallery, df, _ = load_refs_ui()
-            return msg, gallery, df, None, "", ""
+            # 成功后清空路径与输入框；失败保留路径以便重试
+            ok = msg.startswith("已新增")
+            return msg, gallery, df, ("" if ok else path), ("" if ok else name), ("" if ok else desc)
 
         refs_add.click(
             fn=on_refs_add,
-            inputs=[refs_upload, refs_name, refs_desc],
-            outputs=[refs_msg, refs_gallery, refs_df, refs_upload, refs_name, refs_desc],
+            inputs=[refs_upload_path, refs_name, refs_desc],
+            outputs=[refs_msg, refs_gallery, refs_df, refs_upload_path, refs_name, refs_desc],
         )
 
         def on_refs_save(df):

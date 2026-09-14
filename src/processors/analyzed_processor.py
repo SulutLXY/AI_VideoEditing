@@ -12,10 +12,10 @@ import os
 from typing import List, Optional
 
 from src.models import Shot, Provenance
-from src.cv_utils import cv_pre_scan, extract_keyframes, split_video
+from src.cv_utils import cv_pre_scan, split_video
 from src.adapters import find_adapter_for_file, get_adapter
 from src.utils import logger, sec_to_tc, ensure_dir
-from src.processors.common import build_shot_config
+from src.processors.common import build_shot_config, resolve_keyframe_paths
 
 
 class AnalyzedProcessor:
@@ -123,16 +123,15 @@ class AnalyzedProcessor:
             },
         )
 
-        # 提取关键帧
-        keyframes_dir = os.path.join(self.output_dir, "phase1_keyframes")
-        ensure_dir(keyframes_dir)
-        shot.keyframes = extract_keyframes(
+        # 关键帧路径供后续阶段读图（ANALYZED 无预抽帧，走回退现场抽取；
+        # 按整段 0~duration 取时间码，避免原素材时间码越界）
+        shot.keyframes = resolve_keyframe_paths(
+            frames_dir=None,
             video_path=video_path,
             shot_id=shot.shot_id,
-            tc_in=shot.tc_in,
-            tc_out=shot.tc_out,
+            duration=shot.duration_sec,
             fps=shot.fps,
-            output_dir=keyframes_dir,
+            fallback_dir=os.path.join(self.output_dir, "phase1_keyframes"),
             strategy="adaptive",
             interval=2.0,
         )

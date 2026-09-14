@@ -113,6 +113,7 @@ def clean_phase_outputs(output_dir: str, phase: int | None, all_phases: bool = F
             "phase1_analysis.json",
             "phase1_keyframes",
             "phase1_split_clips",
+            "phase1_frames",
         ],
         2: [
             "script_beats_analysis.json",

@@ -34,6 +34,8 @@ class LocalVLMService:
         self.max_frames = int(vision_cfg.get("max_frames", 16))
         self.use_script_context = bool(vision_cfg.get("use_script_context", True))
         self.use_reference_images = bool(vision_cfg.get("use_reference_images", True))
+        # 身份确认调用分辨率：480p / 720p / 1080p（原图永保留，按需降采样）
+        self.identity_resolution = str(vision_cfg.get("identity_resolution", "480p"))
         self.script_max_chars = int(vision_cfg.get("script_max_chars", 1500))
         self.max_ref_images = int(vision_cfg.get("max_ref_images", 8))
 
@@ -131,11 +133,29 @@ class LocalVLMService:
                         if not file_name or not os.path.exists(full):
                             logger.warning(f"[LocalVLM] 清单中的参考图缺失，跳过: {file_name}")
                             continue
+                        # 参考图档案（ref_profiles.json）存在时用关键词档案增强说明，
+                        # 让用户备注 + 本地模型提取的类型/性别/身份/特征一起进 prompt
+                        desc = str(e.get("description", "")).strip()
+                        try:
+                            from src.local_models.ref_profiler import profile_to_desc
+                            profiles_path = os.path.join(base, "ref_profiles.json")
+                            if os.path.exists(profiles_path):
+                                with open(profiles_path, encoding="utf-8") as pf:
+                                    pdata = json.load(pf)
+                                prof = (pdata.get("references") or {}).get(
+                                    str(e.get("name", "")).strip()
+                                )
+                                if prof:
+                                    kw = profile_to_desc(prof)
+                                    note = str(prof.get("user_note", "")).strip()
+                                    desc = kw + (f"；备注:{note}" if note else "")
+                        except Exception:
+                            pass
                         try:
                             refs.append((
                                 str(e.get("name", "")).strip(),
                                 Image.open(full).convert("RGB"),
-                                str(e.get("description", "")).strip(),
+                                desc,
                             ))
                         except Exception as ex:
                             logger.warning(f"[LocalVLM] 参考图读取失败 {full}: {ex}")
@@ -207,6 +227,7 @@ class LocalVLMService:
         video_path: str,
         frames: List[Tuple[float, str]],
         duration: float,
+        frames_dir: Optional[str] = None,
     ) -> Dict[str, Any]:
         """对单个视频片段（或已切分 Shot）做完整内容分析"""
         if not self.enabled:
@@ -223,6 +244,8 @@ class LocalVLMService:
                 max_frames=self.max_frames,
                 script_context=self._load_script_context() if self.use_script_context else None,
                 ref_images=self._load_ref_images() if self.use_reference_images else None,
+                frames_dir=frames_dir,
+                identity_resolution=self.identity_resolution,
             )
             return self._map_to_shot_fields(result)
         except Exception as e:

@@ -18,6 +18,13 @@ class VLMService:
     def __init__(self, config: Dict[str, Any]):
         self.config = config.get("models", {}).get("vlm", {})
         self.provider = self.config.get("provider", "openai")
+        # 在线 VLM 总开关：默认仅本地，allow_online 为 true 才放行联网模型
+        if self.provider != "local" and not self.config.get("allow_online", False):
+            logger.warning(
+                f"[VLM] provider={self.provider} 但 models.vlm.allow_online 未开启，"
+                f"强制使用本地 VLM"
+            )
+            self.provider = "local"
         self.model_name = self.config.get("model", "gpt-4o")
         self.max_tokens = self.config.get("max_tokens", 4096)
         self.temperature = self.config.get("temperature", 0.3)
@@ -155,10 +162,11 @@ class VLMService:
         video_path: str,
         frames: List[Tuple[float, str]],
         duration: float,
+        frames_dir: Optional[str] = None,
     ) -> Dict[str, Any]:
         """分析已处理视频的整体内容，不切分"""
         if self.local_service is not None:
-            return self.local_service.analyze_whole_video(video_path, frames, duration)
+            return self.local_service.analyze_whole_video(video_path, frames, duration, frames_dir=frames_dir)
 
         prompt = self._build_whole_video_prompt(frames, duration)
         messages = self.build_messages(prompt, frames)
@@ -364,6 +372,10 @@ class VLMService:
 
     def sample_frames(self, video_path: str, duration: float, temp_dir: str) -> List[Tuple[float, str]]:
         """从视频中抽取帧用于 VLM 分析"""
+        # 本地模型模式下关键帧由 VisionEngine 内部自行抽取，无需 base64 帧
+        if self.local_service is not None:
+            return self.local_service.sample_frames(video_path, duration, temp_dir)
+
         import os
         from src.utils import run_ffmpeg, ensure_dir
 

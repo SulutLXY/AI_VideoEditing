@@ -144,3 +144,49 @@ def build_shot_config(
     base = dict(cv_meta) if cv_meta else {}
     base["shot_config"] = config
     return base
+
+
+def resolve_keyframe_paths(
+    frames_dir: Optional[str],
+    video_path: str,
+    shot_id: str,
+    duration: float,
+    fps: float,
+    fallback_dir: str,
+    strategy: str = "adaptive",
+    interval: float = 2.0,
+) -> List[str]:
+    """解析供 Phase 2 去重/特征使用的关键帧图片路径。
+
+    优先复用阶段A预抽帧（phase1_frames/<stem>/f_*.jpg，取首/中/尾最多 3 张）——
+    与 VLM 分析看的是同一批图，且不再生成 phase1_keyframes 重复产物；
+    无预抽帧（在线 provider 或预抽失败）时回退 ffmpeg 现场抽取，
+    此时按片段文件自身的 0~duration 取时间码，避免原素材时间码导致 -ss 越界。
+    """
+    import os
+    import re
+
+    if frames_dir and os.path.isdir(frames_dir):
+        jpgs = sorted(
+            f for f in os.listdir(frames_dir)
+            if re.fullmatch(r"f_\d{4}\.jpg", f)
+        )
+        if jpgs:
+            if len(jpgs) > 3:
+                pick = sorted({0, len(jpgs) // 2, len(jpgs) - 1})
+                jpgs = [jpgs[i] for i in pick]
+            return [os.path.join(frames_dir, f) for f in jpgs]
+
+    from src.cv_utils import extract_keyframes
+    from src.utils import sec_to_tc, ensure_dir
+    ensure_dir(fallback_dir)
+    return extract_keyframes(
+        video_path=video_path,
+        shot_id=shot_id,
+        tc_in=sec_to_tc(0.0, fps),
+        tc_out=sec_to_tc(duration, fps),
+        fps=fps,
+        output_dir=fallback_dir,
+        strategy=strategy,
+        interval=interval,
+    )

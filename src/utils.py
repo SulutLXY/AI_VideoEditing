@@ -213,8 +213,11 @@ def md5_file(filepath: str) -> str:
 
 def fallback_vlm_to_local(config: Dict[str, Any]) -> bool:
     """
-    当配置使用需要 API Key 的在线 VLM 且未提供 Key 时，自动回退到本地 VLM。
-    直接修改传入的 config 字典，返回是否发生了切换。
+    决定 VLM 是否切换到本地 Qwen2.5-VL。直接修改传入的 config 字典，返回是否发生了切换。
+
+    策略（默认纯本地）：
+    - models.vlm.allow_online 为 true 时才允许使用在线 VLM；否则一律强制本地；
+    - 允许在线但未提供 API Key（配置/环境变量都没有）时，回退到本地。
     """
     vlm_cfg = config.get("models", {}).get("vlm", {})
     provider = vlm_cfg.get("provider", "")
@@ -223,6 +226,12 @@ def fallback_vlm_to_local(config: Dict[str, Any]) -> bool:
     # 已经是本地模型则不处理
     if provider == "local":
         return False
+
+    # 在线开关：默认关闭，仅在显式 allow_online: true 时放行
+    allow_online = bool(vlm_cfg.get("allow_online", False))
+    if not allow_online:
+        _switch_vlm_to_local(config, "配置 models.vlm.allow_online 未开启，强制使用本地 VLM")
+        return True
 
     # 已填写 API Key 也不切换
     if api_key:
@@ -233,6 +242,13 @@ def fallback_vlm_to_local(config: Dict[str, Any]) -> bool:
     if any(os.getenv(k) for k in env_keys):
         return False
 
+    _switch_vlm_to_local(config, "未检测到 VLM API Key，已自动切换为本地 VLM (Qwen2.5-VL)")
+    return True
+
+
+def _switch_vlm_to_local(config: Dict[str, Any], reason: str):
+    """把 VLM provider 切到本地，并补全本地模型默认配置"""
+    vlm_cfg = config.setdefault("models", {}).setdefault("vlm", {})
     local_cfg = config.setdefault("models", {}).setdefault("local", {})
     local_cfg.setdefault("enabled", True)
     local_cfg.setdefault("device", "cuda")
@@ -253,11 +269,7 @@ def fallback_vlm_to_local(config: Dict[str, Any]) -> bool:
 
     vlm_cfg["provider"] = "local"
     vlm_cfg["model"] = vision_cfg["model_id"]
-    logger.warning(
-        "未检测到 VLM API Key，已自动切换为本地 VLM (Qwen2.5-VL)。"
-        "如需使用在线模型，请在 config.yaml 中填写 models.vlm.api_key。"
-    )
-    return True
+    logger.warning(f"{reason}。如需使用在线模型，请在 config.yaml 中设置 models.vlm.allow_online: true 并填写有效 Key。")
 
 
 def load_config(config_path: str) -> Dict:

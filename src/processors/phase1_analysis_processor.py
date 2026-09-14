@@ -10,14 +10,15 @@ Phase 1 分析处理器
 - 不做切分。
 """
 import os
+import json
 from typing import List, Dict, Any, Optional, Callable
 
 from src.models import Shot, Provenance
 from src.services.vlm_service import VLMService
 from src.services.asr_service import ASRService
-from src.cv_utils import cv_pre_scan, extract_keyframes
+from src.cv_utils import cv_pre_scan
 from src.utils import logger, sec_to_tc, ensure_dir
-from src.processors.common import build_shot_config
+from src.processors.common import build_shot_config, resolve_keyframe_paths
 
 
 class Phase1AnalysisProcessor:
@@ -54,6 +55,7 @@ class Phase1AnalysisProcessor:
         source_path: Optional[str] = None,
         tc_in: Optional[str] = None,
         tc_out: Optional[str] = None,
+        frames_dir: Optional[str] = None,
     ) -> List[Shot]:
         """分析单个视频片段，返回完整 Shot
 
@@ -90,12 +92,23 @@ class Phase1AnalysisProcessor:
             logger.error(f"[Phase 1] 无法获取视频时长，跳过: {video_path}")
             return []
 
-        # 2. VLM 采样 + 分析
+        # 2. VLM 采样 + 分析（本地模式下 frames 为空，帧由 engine 从 frames_dir/视频自取）
         frames = self.vlm_service.sample_frames(video_path, duration, self.temp_dir)
-        description = self.vlm_service.analyze_whole_video(video_path, frames, duration)
+        description = self.vlm_service.analyze_whole_video(video_path, frames, duration, frames_dir=frames_dir)
 
-        # 3. ASR 转录
-        asr_segments = self.asr_service.transcribe(video_path, self.temp_dir)
+        # 3. ASR 转录：优先复用阶段A2已落盘的音频分析档案，避免重复转录
+        asr_segments: List[Dict[str, Any]] = []
+        if frames_dir:
+            profile_path = os.path.join(frames_dir, "audio_profile.json")
+            if os.path.exists(profile_path):
+                try:
+                    with open(profile_path, encoding="utf-8") as f:
+                        asr_segments = json.load(f).get("transcript", []) or []
+                    logger.info(f"[Phase 1] 复用音频分析档案: {os.path.basename(frames_dir)}")
+                except Exception as e:
+                    logger.warning(f"[Phase 1] 读取音频档案失败，回退现场转录: {e}")
+        if not asr_segments:
+            asr_segments = self.asr_service.transcribe(video_path, self.temp_dir)
         dialogue_text = " ".join([seg["text"] for seg in asr_segments])
 
         # 4. 人脸识别（若启用本地模型）
@@ -224,16 +237,14 @@ class Phase1AnalysisProcessor:
         }
         shot.cv_metadata = build_shot_config(shot, cv_meta, content_meta, split_clip_path)
 
-        # 8. 提取关键帧
-        keyframes_dir = os.path.join(self.output_dir, "phase1_keyframes")
-        ensure_dir(keyframes_dir)
-        shot.keyframes = extract_keyframes(
+        # 8. 关键帧路径（供 Phase 2 去重/CLIP 特征读图）：优先复用阶段A预抽帧
+        shot.keyframes = resolve_keyframe_paths(
+            frames_dir=frames_dir,
             video_path=video_path,
             shot_id=shot.shot_id,
-            tc_in=shot.tc_in,
-            tc_out=shot.tc_out,
+            duration=duration,
             fps=shot.fps,
-            output_dir=keyframes_dir,
+            fallback_dir=os.path.join(self.output_dir, "phase1_keyframes"),
             strategy=self.keyframe_strategy,
             interval=self.keyframe_interval,
         )

@@ -13,9 +13,9 @@ from typing import List, Dict, Any
 from src.models import Shot, Provenance
 from src.services.vlm_service import VLMService
 from src.services.asr_service import ASRService
-from src.cv_utils import cv_pre_scan, extract_keyframes, split_video
+from src.cv_utils import cv_pre_scan, split_video
 from src.utils import logger, sec_to_tc, ensure_dir
-from src.processors.common import build_shot_config
+from src.processors.common import build_shot_config, resolve_keyframe_paths
 
 
 class ProcessedProcessor:
@@ -103,16 +103,14 @@ class ProcessedProcessor:
         # 统一 shot 配置
         shot.cv_metadata = build_shot_config(shot, cv_meta, description, split_clip_path)
 
-        # 提取关键帧供后续阶段使用
-        keyframes_dir = os.path.join(self.output_dir, "phase1_keyframes")
-        ensure_dir(keyframes_dir)
-        shot.keyframes = extract_keyframes(
+        # 关键帧路径供后续阶段读图（复用阶段A预抽帧，无则回退现场抽取）
+        shot.keyframes = resolve_keyframe_paths(
+            frames_dir=None,
             video_path=video_path,
             shot_id=shot.shot_id,
-            tc_in=shot.tc_in,
-            tc_out=shot.tc_out,
+            duration=duration,
             fps=shot.fps,
-            output_dir=keyframes_dir,
+            fallback_dir=os.path.join(self.output_dir, "phase1_keyframes"),
             strategy="adaptive",
             interval=2.0,
         )
