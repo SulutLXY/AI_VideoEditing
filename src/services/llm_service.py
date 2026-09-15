@@ -15,6 +15,18 @@ from src.models import Shot, ScriptBeat
 from src.utils import logger
 
 
+def _empty_quotes_to_empty(text: Any) -> str:
+    """LLM/表格常把"无值"写成字面量 '\"\"'（两个引号字符），统一置空。
+
+    只处理"引号内为空"的情况；正常引号包裹的台词（如 \"五年了…\"）原样保留。
+    """
+    s = str(text or "")
+    t = s.strip()
+    if len(t) >= 2 and t[0] in "\"'“”‘’" and t[-1] in "\"'“”‘’" and not t[1:-1].strip():
+        return ""
+    return s
+
+
 class LLMService:
     """大语言模型服务"""
 
@@ -330,7 +342,7 @@ class LLMService:
                     "content": str(item.get("content", "")),
                     "emotion": str(item.get("emotion", "")),
                     "key_actions": key_actions,
-                    "key_dialogue": str(item.get("key_dialogue", "")),
+                    "key_dialogue": _empty_quotes_to_empty(item.get("key_dialogue", "")),
                     "estimated_duration": float(item.get("estimated_duration", 0.0) or 0.0),
                     "pace": str(item.get("pace", "正常")),
                     "priority": int(item.get("priority", 3) or 3),
@@ -600,6 +612,10 @@ class LLMService:
             "0.4-0.6 = 部分相关（同场景/同角色，可勉强衔接）\n"
             "0.1-0.3 = 基本无关\n"
             "0.0 = 完全无关\n\n"
+            "## 硬性规则（节点含关键台词时）\n"
+            "若上方情节点「关键台词」非\"无\"：镜头台词与关键台词的语义对应是第一优先级——\n"
+            "同句或同义表述的镜头 match_score 应显著上浮（0.8 以上）；\n"
+            "台词不对应（说的是别的内容）的镜头，即使画面/动作吻合，match_score 不得超过 0.5。\n\n"
             "## 任务\n"
             "对每个候选镜头输出 match_score 和一句简短理由。\n"
             "严格输出 JSON 数组（每个候选一条，shot_id 必须与原样一致）：\n"

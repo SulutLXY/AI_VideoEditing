@@ -56,11 +56,13 @@ class Phase1AnalysisProcessor:
         tc_in: Optional[str] = None,
         tc_out: Optional[str] = None,
         frames_dir: Optional[str] = None,
+        on_shot_done: Optional[Callable[[Shot], None]] = None,
     ) -> List[Shot]:
         """分析单个视频片段，返回完整 Shot
 
         当分析的是 Phase 0 粗剪片段时，必须传入原始 source_file/source_path，
         否则 source_file 会被错误地记录为片段文件名（如 S086.mp4）。
+        on_shot_done：单镜头分析完成即回调（立即落盘配置，支持中断续跑）。
         """
         filename = os.path.basename(video_path)
         logger.info(f"[Phase 1] 分析: {filename}")
@@ -248,5 +250,12 @@ class Phase1AnalysisProcessor:
             strategy=self.keyframe_strategy,
             interval=self.keyframe_interval,
         )
+
+        # 9. 单镜头完成回调：立即落盘该镜头配置（json 与 mp4 同步出现）
+        if on_shot_done is not None:
+            try:
+                on_shot_done(shot)
+            except Exception as e:
+                logger.warning(f"[Phase 1] 镜头完成回调失败 {shot.shot_id}: {e}")
 
         return [shot]

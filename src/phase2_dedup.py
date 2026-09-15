@@ -324,6 +324,28 @@ class Phase2TakeSelector:
         return features.squeeze().numpy()
 
     # ------------------------------------------------------------------
+    # 节点关键台词提取（key_dialogue 优先，其次 dialogue_entries 拼接）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _beat_dialogue(beat: ScriptBeat) -> str:
+        """节点关键台词：key_dialogue 优先，其次 dialogue_entries 拼接。
+
+        注意：无台词节点的 key_dialogue 可能存的是字面量 '""'（两个引号字符），
+        必须剥掉引号后再判空，否则无台词节点会被误判为台词节点。
+        """
+        def _clean(text: str) -> str:
+            return str(text or "").replace('"', "").replace("“", "").replace("”", "").strip()
+
+        dialogue = _clean(getattr(beat, "key_dialogue", ""))
+        if dialogue:
+            return dialogue
+        entries = getattr(beat, "dialogue_entries", None) or []
+        return " ".join(
+            _clean(e.get("text", ""))
+            for e in entries if isinstance(e, dict) and _clean(e.get("text", ""))
+        ).strip()
+
+    # ------------------------------------------------------------------
     # 逐节点竞争式选镜（含时长变速控制）
     # ------------------------------------------------------------------
     def _select_for_beat(
@@ -372,6 +394,7 @@ class Phase2TakeSelector:
                       for s in pool}
 
         # 2) 积分（含跨节点连贯性上下文）
+        beat_dialogue = self._beat_dialogue(beat)
         cands = []
         for shot in pool:
             r = ranked.get(shot.shot_id)
@@ -381,12 +404,28 @@ class Phase2TakeSelector:
             if m < min_match:
                 continue
             ctx = ScoreContext(prev_shot=prev_shot, target_segment_duration=budget)
-            total = self.quality_scorer.score_with_script_match(shot, m, ctx)
+            total = self.quality_scorer.score_with_script_match(
+                shot, m, ctx, beat_dialogue=beat_dialogue
+            )
             if self._is_transition_boost(beat, shot):
                 total += 1.0  # 变装/状态转换镜头加分（满分 10 分制）
+            dm = self.quality_scorer._dialogue_match_score(beat_dialogue, shot) if beat_dialogue else 0.0
             cands.append({"shot": shot, "score": round(total, 2), "match": m,
-                          "reasoning": r.get("reasoning", "")})
+                          "reasoning": r.get("reasoning", ""), "dm": dm})
         cands.sort(key=lambda c: c["score"], reverse=True)
+
+        # 2.5) 台词优先组：节点含台词时，把覆盖了 ≥7 成节点台词的镜头
+        #      拉到一起排在最前（组内仍按积分），首帧镜头从该组产生；
+        #      优先组为空则回退到全池排序（台词加分的部分分仍在起作用）。
+        if beat_dialogue:
+            priority = [c for c in cands if c["dm"] >= 1.0]
+            if priority:
+                rest = [c for c in cands if c["dm"] < 1.0]
+                cands = priority + rest
+                logger.info(
+                    f"  台词优先组 {len(priority)} 镜: "
+                    f"{[c['shot'].shot_id for c in priority]}（覆盖≥7成节点台词，首镜从组内选）"
+                )
 
         if not cands:
             # 放宽阈值重试一次：取 match 最高者（哪怕低于阈值）

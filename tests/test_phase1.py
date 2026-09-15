@@ -219,7 +219,7 @@ class TestProcessedProcessor(unittest.TestCase):
 
     @patch("src.processors.processed_processor.split_video")
     @patch("src.processors.processed_processor.cv_pre_scan")
-    @patch("src.processors.processed_processor.extract_keyframes")
+    @patch("src.cv_utils.extract_keyframes")
     def test_processed_not_split(self, mock_extract, mock_cv, mock_split):
         """PROCESSED 素材应只生成一个 Shot，不切分，并生成配置与物理片段"""
         mock_cv.return_value = mock_cv_meta(duration=15.0)
@@ -254,7 +254,7 @@ class TestAnalyzedProcessor(unittest.TestCase):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     @patch("src.processors.analyzed_processor.split_video")
-    @patch("src.processors.analyzed_processor.extract_keyframes")
+    @patch("src.cv_utils.extract_keyframes")
     @patch("src.processors.analyzed_processor.cv_pre_scan")
     def test_analyzed_adapter_read(self, mock_cv, mock_extract, mock_split):
         """ANALYZED 素材通过 custom_v1 adapter 读取，不分析不切分，并生成配置"""
@@ -289,7 +289,7 @@ class TestAnalyzedProcessor(unittest.TestCase):
         self.assertTrue(mock_split.called)
 
     @patch("src.processors.analyzed_processor.split_video")
-    @patch("src.processors.analyzed_processor.extract_keyframes")
+    @patch("src.cv_utils.extract_keyframes")
     @patch("src.processors.analyzed_processor.cv_pre_scan")
     def test_analyzed_missing_meta_fallback(self, mock_cv, mock_extract, mock_split):
         """ANALYZED 素材找不到分析文件时 fallback 并标记复核"""

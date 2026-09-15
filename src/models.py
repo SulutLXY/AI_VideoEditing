@@ -148,6 +148,15 @@ class ScriptBeat:
         return data
 
     @staticmethod
+    def _clean_dialogue_value(text: Any) -> str:
+        """字面量 '\"\"'（引号内为空）统一置空；正常引号包裹的台词保留。"""
+        s = str(text or "")
+        t = s.strip()
+        if len(t) >= 2 and t[0] in "\"'“”‘’" and t[-1] in "\"'“”‘’" and not t[1:-1].strip():
+            return ""
+        return s
+
+    @staticmethod
     def from_dict(data: Dict[str, Any]) -> "ScriptBeat":
         """从字典重建 ScriptBeat，兼容旧版无 analysis/sub_beats 字段"""
         if not data:
@@ -161,7 +170,7 @@ class ScriptBeat:
             content=data.get("content", ""),
             emotion=data.get("emotion", ""),
             key_actions=data.get("key_actions") or [],
-            key_dialogue=data.get("key_dialogue", ""),
+            key_dialogue=ScriptBeat._clean_dialogue_value(data.get("key_dialogue", "")),
             gender_state=data.get("gender_state", ""),
             gender_transition=data.get("gender_transition", ""),
             estimated_duration=float(data.get("estimated_duration", 0.0) or 0.0),

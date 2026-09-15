@@ -1,12 +1,24 @@
 """
-Phase 0: 纯 CV 粗剪（v0.2 定版）
+Phase 0: CV 粗剪 + 片段级产物（v0.3）
 
 职责：
 - 对 RAW 原始素材做镜头级粗切分。
-- 不调用 VLM/LLM，不调用 ASR，不建立关系图。
+- 不调用 VLM/LLM，不建立关系图。
 - 基于 OpenCV 逐帧灰度直方图差异 + 孤立峰值分析判断硬切点。
 - 对持续高活动区域（运动/叠化/淡入淡出/高速镜头）做软转场保护，不切分。
-- 输出切好的片段文件和粗配置文件。
+
+每个粗剪片段产出"四件套"（出一个同步落盘一个，支持断点续跑）：
+- Sxxx.mp4            粗剪片段（FFmpeg -c copy）
+- Sxxx_config.json    片段配置：切点/时长/帧率/画质/运动档案（光流幅值、主体速度档、
+                      各档帧数分布）/抽帧清单/音频档案摘要
+- Sxxx_frames/        自适应三档参考帧（480p jpg + frames.json + meta.json + motion.json）
+                      按片段内局部变化速度抽帧：静止档(≥0.90)显著变化+2s锚点 /
+                      中速档(0.70~0.90)每0.5s / 快变化档(<0.70)每0.1s且单段封顶10帧；
+                      档位切换带 0.3s 滞回，相似度按片段自身中位数基准归一化
+- Sxxx_frames/audio.wav + audio_profile.json
+                      16k 单声道音频 + SenseVoice 分析档案（台词/语言/情绪/事件/
+                      声音环境：speech / ambient_or_bgm / silent），供 Phase 1 VLM prompt
+                      注入与 Phase 4 混音参考（CPU 串行跑，幂等跳过已有档案）
 
 积分规则（v0.2 定版）：
 - 逐帧计算相邻帧灰度直方图差异，得到 cut_score（0~1）。
@@ -22,6 +34,9 @@ Phase 0: 纯 CV 粗剪（v0.2 定版）
 - 片段时长低于 min_shot_duration 时合并。
 """
 import os
+import re
+import json
+import subprocess
 from typing import List, Dict, Any, Tuple
 
 from src.cv_utils import (
@@ -57,6 +72,13 @@ class RoughCutAnalyzer:
         self.soft_transition_gap_tol = phase0_cfg.get("soft_transition_gap_tol", 0.15)
         self.soft_transition_min_duration = phase0_cfg.get("soft_transition_min_duration", 0.6)
         self.min_shot_duration = self.processing.get("min_shot_duration", 1.0)
+
+        # 自适应抽帧配置（phase0.adaptive_frames 可覆盖默认值）
+        self.adaptive_cfg = dict(phase0_cfg.get("adaptive_frames", {}))
+        self.adaptive_enabled = phase0_cfg.get("adaptive_frames", {}).get("enabled", True)
+        # 音频分析（SenseVoice 串行，CPU/GPU 由 models.local.device 决定）
+        self.audio_analysis_enabled = phase0_cfg.get("audio_analysis", True)
+        self._asr_engine = None
 
         self._shot_counter = 0
 
@@ -131,6 +153,204 @@ class RoughCutAnalyzer:
         # 5. 切分物理片段并生成 Shot
         shots = self._split_and_build_shots(video_path, cv_meta, cut_times, soft_transitions)
         return shots
+
+    # ------------------------------------------------------------------
+    # 片段级产物：自适应抽帧 + 音频分析 + 独立 config.json（出一个落盘一个）
+    # ------------------------------------------------------------------
+
+    def _enrich_clip(
+        self,
+        shot_id: str,
+        clip_path: str,
+        start: float,
+        end: float,
+        fps: float,
+        source_file: str,
+        source_path: str,
+    ) -> Dict[str, Any]:
+        """为单个粗剪片段生成四件套产物并写出独立 config.json。
+
+        返回注入 shot.cv_metadata["shot_config"] 的配置 dict。
+        所有步骤幂等：已有产物直接复用；单步失败不影响其余产物。
+        """
+        clips_dir = self.rough_clips_dir
+        frames_dir = os.path.join(clips_dir, f"{shot_id}_frames")
+
+        clip_cfg: Dict[str, Any] = {
+            "shot_id": shot_id,
+            "clip_path": os.path.abspath(clip_path) if clip_path else "",
+            "source_file": source_file,
+            "source_path": source_path,
+            "tc_in": sec_to_tc(start, fps),
+            "tc_out": sec_to_tc(end, fps),
+            "duration_sec": round(end - start, 3),
+            "fps": fps,
+        }
+
+        # 1) 自适应三档抽帧（480p jpg + frames.json + meta.json + motion.json）
+        motion: Dict[str, Any] = {}
+        frames_meta: Dict[str, Any] = {}
+        if self.adaptive_enabled and clip_path and os.path.exists(clip_path):
+            try:
+                from src.adaptive_frame_extractor import extract_adaptive_frames
+                result = extract_adaptive_frames(clip_path, frames_dir, self.adaptive_cfg)
+                if result:
+                    motion = result.get("motion", {})
+                    frames_meta = result.get("meta", {})
+            except Exception as e:
+                logger.warning(f"[Phase 0] 自适应抽帧失败 {shot_id}: {e}")
+        clip_cfg["frames"] = {
+            "dir": os.path.basename(frames_dir),
+            "count": frames_meta.get("frame_count", 0),
+            "manifest": "frames.json",
+            "meta": "meta.json",
+        }
+        clip_cfg["motion"] = motion
+
+        # 2) 音频抽取 + SenseVoice 分析档案（audio.wav / audio_profile.json）
+        audio_profile: Dict[str, Any] = {}
+        if clip_path and os.path.exists(clip_path):
+            has_audio = self._extract_audio_wav(clip_path, frames_dir)
+            if has_audio and self.audio_analysis_enabled:
+                audio_profile = self._analyze_clip_audio(shot_id, frames_dir)
+        clip_cfg["audio"] = {
+            "wav": "audio.wav",
+            "profile": "audio_profile.json",
+            "has_speech": bool(audio_profile.get("has_speech")),
+            "sound_env": audio_profile.get("sound_env", ""),
+        }
+
+        # 3) 独立 config.json 随片段同步落盘
+        config_path = os.path.join(clips_dir, f"{shot_id}_config.json")
+        clip_cfg["config_path"] = os.path.basename(config_path)
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(clip_cfg, f, ensure_ascii=False, indent=2)
+        return clip_cfg
+
+    @staticmethod
+    def _extract_audio_wav(video_path: str, out_dir: str) -> bool:
+        """抽取 16k 单声道 wav 到帧目录（幂等）。返回是否存在音频轨。"""
+        os.makedirs(out_dir, exist_ok=True)
+        wav_path = os.path.join(out_dir, "audio.wav")
+        if os.path.exists(wav_path):
+            return True
+        try:
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                 "-i", video_path, "-vn", "-acodec", "pcm_s16le",
+                 "-ar", "16000", "-ac", "1", wav_path],
+                capture_output=True, text=True,
+            )
+            if r.returncode != 0 or not os.path.exists(wav_path):
+                return False
+            # 空音频（0 字节级）视为无音频轨
+            return os.path.getsize(wav_path) > 4096
+        except Exception as e:
+            logger.warning(f"[Phase 0] 抽取音频失败 {os.path.basename(video_path)}: {e}")
+            return False
+
+    @staticmethod
+    def _detect_volume(wav_path: str) -> Dict[str, Any]:
+        """ffmpeg volumedetect 检测平均/最大音量（dB）"""
+        try:
+            r = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-i", wav_path,
+                 "-af", "volumedetect", "-f", "null", "-"],
+                capture_output=True, text=True,
+            )
+            out = (r.stderr or "") + (r.stdout or "")
+            mean = mx = None
+            m = re.search(r"mean_volume: ([-\d.]+) dB", out)
+            if m:
+                mean = float(m.group(1))
+            m = re.search(r"max_volume: ([-\d.]+) dB", out)
+            if m:
+                mx = float(m.group(1))
+            return {"mean_volume_db": mean, "max_volume_db": mx}
+        except Exception:
+            return {"mean_volume_db": None, "max_volume_db": None}
+
+    def _analyze_clip_audio(self, shot_id: str, frames_dir: str) -> Dict[str, Any]:
+        """SenseVoice 串行分析单个片段音频（幂等：已有 audio_profile.json 直接读）。"""
+        profile_path = os.path.join(frames_dir, "audio_profile.json")
+        if os.path.exists(profile_path):
+            try:
+                with open(profile_path, encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        wav_path = os.path.join(frames_dir, "audio.wav")
+        if not os.path.exists(wav_path):
+            return {}
+
+        try:
+            engine = self._get_asr_engine()
+            if engine is None:
+                return {}
+            result = engine.process_wav(wav_path)
+            volume = self._detect_volume(wav_path)
+            mean_db = volume.get("mean_volume_db")
+            has_speech = bool(result.get("has_speech"))
+            # 无对白镜头靠音量区分：纯静音 vs 有 BGM/环境音
+            if has_speech:
+                sound_env = "speech"
+            elif mean_db is not None and mean_db > -45.0:
+                sound_env = "ambient_or_bgm"
+            else:
+                sound_env = "silent"
+            profile = {
+                "has_speech": has_speech,
+                "event": result.get("event"),
+                "language": result.get("language"),
+                "emotion": result.get("emotion"),
+                "sound_env": sound_env,
+                **volume,
+                "text": result.get("text", ""),
+                "transcript": result.get("transcriptions", []),
+            }
+            with open(profile_path, "w", encoding="utf-8") as f:
+                json.dump(profile, f, ensure_ascii=False, indent=2)
+
+            desc_bits = []
+            if profile["language"]:
+                desc_bits.append(profile["language"])
+            desc_bits.append(profile["event"] or ("Speech" if profile["has_speech"] else {
+                "ambient_or_bgm": "BGM/环境音",
+                "silent": "静音",
+            }.get(sound_env, "无语音")))
+            if profile["emotion"]:
+                desc_bits.append(profile["emotion"])
+            desc_bits.append("有台词" if profile["text"] else "无台词")
+            logger.info(
+                f"[Phase 0] 音频分析 {shot_id}: {'/'.join(desc_bits)}"
+                + (f" \"{profile['text'][:30]}\"" if profile["text"] else "")
+            )
+            return profile
+        except Exception as e:
+            logger.warning(f"[Phase 0] 音频分析失败 {shot_id}: {e}")
+            return {}
+
+    def _get_asr_engine(self):
+        """惰性创建 ASR 引擎（model_id/batch_size 取 models.local.asr，device 取 models.local.device）"""
+        if self._asr_engine is not None:
+            return self._asr_engine
+        local_cfg = self.config.get("models", {}).get("local", {})
+        if not local_cfg.get("enabled", False):
+            return None
+        try:
+            from src.local_models.asr_engine import ASREngine
+            asr_cfg = local_cfg.get("asr", {})
+            self._asr_engine = ASREngine(
+                model_id=asr_cfg.get("model_id", "iic/SenseVoiceSmall"),
+                device=local_cfg.get("device", "cuda"),
+                batch_size=asr_cfg.get("batch_size", 1),
+                cache_dir=local_cfg.get("cache_dir"),
+            )
+            return self._asr_engine
+        except Exception as e:
+            logger.warning(f"[Phase 0] ASR 引擎创建失败，跳过音频分析: {e}")
+            self._asr_engine = None
+            return None
 
     def _analyze_samples(
         self,
@@ -416,6 +636,21 @@ class RoughCutAnalyzer:
                 if st["start"] >= start - 0.05 and st["end"] <= end + 0.05
             ]
 
+            # 片段级产物：自适应抽帧 + 音频分析 + 独立 config.json（出一个落盘一个）
+            clip_cfg: Dict[str, Any] = {}
+            if clip_path and os.path.exists(clip_path):
+                try:
+                    clip_cfg = self._enrich_clip(
+                        shot_id, clip_path, start, end, fps, filename,
+                        os.path.abspath(video_path),
+                    )
+                except Exception as e:
+                    logger.warning(f"[Phase 0] 片段产物生成失败 {shot_id}: {e}")
+
+            shot_cv_meta = dict(cv_meta)
+            if clip_cfg:
+                shot_cv_meta["shot_config"] = clip_cfg
+
             shot = Shot(
                 shot_id=shot_id,
                 state="RAW",
@@ -430,7 +665,7 @@ class RoughCutAnalyzer:
                 bitrate=cv_meta.get("bitrate"),
                 codec=cv_meta.get("codec"),
                 visual_quality=cv_meta.get("visual_quality"),
-                cv_metadata=cv_meta,
+                cv_metadata=shot_cv_meta,
                 soft_transitions=shot_soft_transitions,
                 needs_review=True,
                 provenance=Provenance(
@@ -522,6 +757,20 @@ class RoughCutAnalyzer:
             logger.warning(f"FFmpeg 整段拷贝失败 {shot_id}: {e}")
             clip_path = ""
 
+        # 片段级产物（整段输出同样给四件套）
+        clip_cfg: Dict[str, Any] = {}
+        if clip_path and os.path.exists(clip_path):
+            try:
+                clip_cfg = self._enrich_clip(
+                    shot_id, clip_path, 0.0, duration, fps, filename,
+                    os.path.abspath(video_path),
+                )
+            except Exception as e:
+                logger.warning(f"[Phase 0] 片段产物生成失败 {shot_id}: {e}")
+        shot_cv_meta = dict(cv_meta)
+        if clip_cfg:
+            shot_cv_meta["shot_config"] = clip_cfg
+
         return Shot(
             shot_id=shot_id,
             state="RAW",
@@ -536,7 +785,7 @@ class RoughCutAnalyzer:
             bitrate=cv_meta.get("bitrate"),
             codec=cv_meta.get("codec"),
             visual_quality=cv_meta.get("visual_quality"),
-            cv_metadata=cv_meta,
+            cv_metadata=shot_cv_meta,
             soft_transitions=soft_transitions,
             needs_review=True,
             provenance=Provenance(

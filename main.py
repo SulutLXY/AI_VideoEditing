@@ -499,18 +499,21 @@ def main():
         elif phase == 3:
             # Phase 3: 镜头筛选 + 排序 + 去重（原 Phase2TakeSelector）
             if shots is None:
-                # 优先从 Phase 2 选择后的结果加载，回退到 Phase 1
-                phase2_path = os.path.join(output_dir, 'phase2_selected_shots.json')
+                # 必须从 Phase 1 完整分析加载（含台词/角色等全部字段）；
+                # 不能优先读 phase2_selected_shots.json——那是上一次筛选的输出，
+                # 用它做输入会形成自我回环（旧选择状态/丢失字段会逐轮固化，
+                # 例如 dialogue 字段曾在某轮清空后永远回不来）。
                 phase1_path = os.path.join(output_dir, 'phase1_analysis.json')
+                phase2_path = os.path.join(output_dir, 'phase2_selected_shots.json')
 
-                if os.path.exists(phase2_path):
-                    with open(phase2_path, 'r', encoding='utf-8') as f:
-                        shots = [Shot.from_dict(s) for s in json.load(f).get('shots', [])]
-                    logger.info(f"从 Phase 2 加载 {len(shots)} 个带选择状态的镜头用于 Phase 3")
-                elif os.path.exists(phase1_path):
+                if os.path.exists(phase1_path):
                     with open(phase1_path, 'r', encoding='utf-8') as f:
                         shots = [Shot.from_dict(s) for s in json.load(f).get('shots', [])]
-                    logger.warning(f"未找到 Phase 2 选择结果，从 Phase 1 回退加载 {len(shots)} 个镜头（状态均为候选）")
+                    logger.info(f"从 Phase 1 加载 {len(shots)} 个镜头用于 Phase 3 竞争匹配")
+                elif os.path.exists(phase2_path):
+                    with open(phase2_path, 'r', encoding='utf-8') as f:
+                        shots = [Shot.from_dict(s) for s in json.load(f).get('shots', [])]
+                    logger.warning(f"未找到 Phase 1 分析结果，从上次筛选结果回退加载 {len(shots)} 个镜头")
                 else:
                     # 从素材库目录做 CV 轻量清点
                     materials_dir = args.materials_dir or config['paths'].get('raw_materials')
@@ -554,6 +557,15 @@ def main():
                     beat_analysis = load_json(analysis_path).get('analysis', {})
                 except Exception:
                     pass
+
+            # 台词修正（独立可选环节，幂等）：用剧情节点台词校对 ASR 台词的同音/错字，
+            # 修正结果回写 phase1 三处产物，提升后续台词 bigram 匹配积分
+            try:
+                from src.dialogue_corrector import DialogueCorrector
+                corrector = DialogueCorrector(config)
+                corrector.run(shots, script_beats)
+            except Exception as e:
+                logger.warning(f"台词修正失败（保留 ASR 原文）: {e}")
 
             selector = Phase2TakeSelector(config)
             shots, report = selector.run(shots, script_beats, beat_analysis)

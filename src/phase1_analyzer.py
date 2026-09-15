@@ -9,7 +9,6 @@ Phase 1: 素材多模态语义分析
 - 不建立关系图（关系图在后续按需由上层业务生成）。
 """
 import os
-import re
 import json
 from typing import List, Dict, Any, Tuple, Optional
 
@@ -61,38 +60,38 @@ class Phase1Analyzer:
         )
 
         self._shot_counter = 0
-        # 阶段A预抽帧结果：片段绝对路径 -> 帧目录（stage A 填充，stage B 消费）
+        # Phase 0 产物映射：片段绝对路径 -> phase0_rough_clips/Sxxx_frames/
+        # （自适应抽帧 + 音频档案，由 _resolve_phase0_assets 填充）
         self._frames_dirs: Dict[str, str] = {}
 
     def _next_shot_id(self) -> str:
         self._shot_counter += 1
         return f"S{self._shot_counter:03d}"
 
-    def _preextract_all_frames(self, video_tasks: List[Tuple[str, str, Optional[str]]]):
-        """阶段A：纯 CV 预抽帧（480p jpg 落盘），与 LLM 分析解耦。
+    def _resolve_phase0_assets(self, video_tasks: List[Tuple[str, str, Optional[str]]]):
+        """阶段A替代：定位 Phase 0 每片段产物（自适应抽帧 + 音频档案）。
 
-        全部片段先抽好帧，用户可从日志/phase1_frames 目录实时看到解析进度；
-        分析中断后重跑时帧直接复用（幂等），LLM 阶段只读图不再解码视频。
+        Phase 0 已随片段落盘 phase0_rough_clips/Sxxx_frames/
+        （frames.json/meta.json/audio.wav/audio_profile.json），这里只做映射不做重算；
+        找不到的片段由 VLM 分析时回退现场抽帧、由 ASR 服务回退现场转录。
         """
-        local = getattr(self.vlm_service, "local_service", None)
-        if local is None or not getattr(local, "enabled", False):
-            return
-
-        from src.local_models.vision_engine import VisionEngine
-
-        frames_root = os.path.join(self.output_dir, "phase1_frames")
-        ensure_dir(frames_root)
-
-        # 汇总所有待分析的视频（RAW 解析到片段级，PROCESSED 整段）
-        clip_paths: List[str] = []
-        rough_shots: List[Shot] = []
         rough_config_path = os.path.join(self.output_dir, "phase0_rough_config.json")
+        rough_shots: List[Shot] = []
         if os.path.exists(rough_config_path):
             try:
                 rough_data = load_json(rough_config_path)
                 rough_shots = [Shot.from_dict(s) for s in rough_data.get("shots", [])]
             except Exception as e:
-                logger.warning(f"[Phase 1] 读取 Phase 0 配置失败，预抽帧按整段处理: {e}")
+                logger.warning(f"[Phase 1] 读取 Phase 0 配置失败: {e}")
+
+        clips_dir = os.path.join(self.output_dir, "phase0_rough_clips")
+
+        def _map_clip(cp: str):
+            ap = os.path.abspath(cp)
+            stem = os.path.splitext(os.path.basename(ap))[0]
+            frames_dir = os.path.join(clips_dir, f"{stem}_frames")
+            if os.path.exists(os.path.join(frames_dir, "frames.json")):
+                self._frames_dirs[ap] = frames_dir
 
         for path, state, _ in video_tasks:
             if state == "ANALYZED":
@@ -101,173 +100,20 @@ class Phase1Analyzer:
                 source_file = os.path.basename(path)
                 relevant = [s for s in rough_shots if s.source_file == source_file]
                 if not relevant:
-                    clip_paths.append(path)
+                    _map_clip(path)
                 else:
                     for rs in relevant:
                         cp = self._resolve_clip_path(rs)
                         if cp and os.path.exists(cp):
-                            clip_paths.append(cp)
-            else:  # PROCESSED 整段分析
-                clip_paths.append(path)
+                            _map_clip(cp)
+            else:  # PROCESSED 整段：若 Phase 0 恰好有同名产物则复用
+                _map_clip(path)
 
-        # 去重（同一片段不重复抽帧）；目录名冲突时加路径哈希后缀
-        seen = set()
-        used_stems: Dict[str, str] = {}
-        total, ok = 0, 0
-        for cp in clip_paths:
-            ap = os.path.abspath(cp)
-            if ap in seen:
-                continue
-            seen.add(ap)
-            total += 1
-
-            stem = os.path.splitext(os.path.basename(ap))[0]
-            owner = used_stems.get(stem)
-            if owner is None:
-                used_stems[stem] = ap
-            elif owner != ap:
-                import hashlib
-                stem = f"{stem}_{hashlib.md5(ap.encode('utf-8')).hexdigest()[:6]}"
-
-            out_dir = os.path.join(frames_root, stem)
-            meta = VisionEngine.preextract_frames(
-                ap, out_dir,
-                count=local.keyframe_count,
-                interval=local.frame_interval,
-                max_frames=local.max_frames,
+        if self._frames_dirs:
+            logger.info(
+                f"[Phase 1] Phase 0 产物就绪: {len(self._frames_dirs)} 个片段"
+                f"（帧 + 音频档案）"
             )
-            if meta:
-                ok += 1
-                self._frames_dirs[ap] = out_dir
-                has_audio = self._extract_audio_wav(ap, out_dir)
-                logger.info(
-                    f"[Phase 1] 帧已就绪 {os.path.basename(ap)}: "
-                    f"{meta['frame_count']} 帧 / {meta['duration']}s"
-                    + ("（含音频）" if has_audio else "（无音频轨）")
-                )
-            else:
-                logger.warning(f"[Phase 1] 预抽帧失败（分析时将回退现场抽帧）: {ap}")
-
-        logger.info(f"[Phase 1] 预抽帧完成: {ok}/{total} 个片段帧就绪 -> {frames_root}")
-
-    @staticmethod
-    def _extract_audio_wav(video_path: str, out_dir: str) -> bool:
-        """抽取 16k 单声道 wav 到帧目录（幂等）。返回是否存在音频轨。"""
-        import subprocess
-        wav_path = os.path.join(out_dir, "audio.wav")
-        if os.path.exists(wav_path):
-            return True
-        try:
-            r = subprocess.run(
-                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                 "-i", video_path, "-vn", "-acodec", "pcm_s16le",
-                 "-ar", "16000", "-ac", "1", wav_path],
-                capture_output=True, text=True,
-            )
-            if r.returncode != 0 or not os.path.exists(wav_path):
-                return False
-            # 空音频（0 字节级）视为无音频轨
-            return os.path.getsize(wav_path) > 4096
-        except Exception as e:
-            logger.warning(f"[Phase 1] 抽取音频失败 {os.path.basename(video_path)}: {e}")
-            return False
-
-    @staticmethod
-    def _detect_volume(wav_path: str) -> Dict[str, Optional[float]]:
-        """ffmpeg volumedetect 检测平均/最大音量（dB）"""
-        import subprocess
-        try:
-            r = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-i", wav_path,
-                 "-af", "volumedetect", "-f", "null", "-"],
-                capture_output=True, text=True,
-            )
-            out = (r.stderr or "") + (r.stdout or "")
-            mean = mx = None
-            m = re.search(r"mean_volume: ([-\d.]+) dB", out)
-            if m:
-                mean = float(m.group(1))
-            m = re.search(r"max_volume: ([-\d.]+) dB", out)
-            if m:
-                mx = float(m.group(1))
-            return {"mean_volume_db": mean, "max_volume_db": mx}
-        except Exception:
-            return {"mean_volume_db": None, "max_volume_db": None}
-
-    def _analyze_all_audio(self):
-        """阶段A2：串行音频分析（SenseVoice，CPU 跑，不与 GPU 上的 VLM 抢显存）。
-
-        逐片段生成 audio_profile.json：
-          { has_speech, event, language, emotion,
-            mean_volume_db, max_volume_db,
-            text, transcript: [{start,end,text}] }
-        已存在的跳过（幂等）。产物供 VLM prompt 注入与 Phase 4 混音参考。
-        """
-        local_asr = getattr(self.asr_service, "local_service", None)
-        if local_asr is None or not getattr(local_asr, "enabled", False):
-            logger.info("[Phase 1] 本地 ASR 未启用，跳过阶段A2音频分析")
-            return
-
-        engine = None
-        total, ok = 0, 0
-        for clip_path, frames_dir in self._frames_dirs.items():
-            profile_path = os.path.join(frames_dir, "audio_profile.json")
-            if os.path.exists(profile_path):
-                continue
-            wav_path = os.path.join(frames_dir, "audio.wav")
-            if not os.path.exists(wav_path):
-                continue
-
-            total += 1
-            try:
-                if engine is None:
-                    engine = local_asr._get_engine()
-                result = engine.process_wav(wav_path)
-                volume = self._detect_volume(wav_path)
-                mean_db = volume.get("mean_volume_db")
-                has_speech = bool(result.get("has_speech"))
-                # 无对白镜头靠音量区分：纯静音 vs 有 BGM/环境音
-                if has_speech:
-                    sound_env = "speech"
-                elif mean_db is not None and mean_db > -45.0:
-                    sound_env = "ambient_or_bgm"
-                else:
-                    sound_env = "silent"
-                profile = {
-                    "has_speech": has_speech,
-                    "event": result.get("event"),
-                    "language": result.get("language"),
-                    "emotion": result.get("emotion"),
-                    "sound_env": sound_env,
-                    **volume,
-                    "text": result.get("text", ""),
-                    "transcript": result.get("transcriptions", []),
-                }
-                with open(profile_path, "w", encoding="utf-8") as f:
-                    json.dump(profile, f, ensure_ascii=False, indent=2)
-                ok += 1
-
-                # 一行摘要：语言/事件/情绪/有无台词
-                desc_bits = []
-                if profile["language"]:
-                    desc_bits.append(profile["language"])
-                desc_bits.append(profile["event"] or ("Speech" if profile["has_speech"] else {
-                    "ambient_or_bgm": "BGM/环境音",
-                    "silent": "静音",
-                }.get(sound_env, "无语音")))
-                if profile["emotion"]:
-                    desc_bits.append(profile["emotion"])
-                desc_bits.append("有台词" if profile["text"] else "无台词")
-                logger.info(
-                    f"[Phase 1] 音频分析 {os.path.basename(clip_path)}: "
-                    f"{'/'.join(desc_bits)}"
-                    + (f" \"{profile['text'][:30]}\"" if profile["text"] else "")
-                )
-            except Exception as e:
-                logger.warning(f"[Phase 1] 音频分析失败 {os.path.basename(clip_path)}: {e}")
-
-        if total:
-            logger.info(f"[Phase 1] 音频分析完成: {ok}/{total} 个片段")
 
     def run(self) -> List[Shot]:
         """执行 Phase 1 分析"""
@@ -284,17 +130,9 @@ class Phase1Analyzer:
         for path, state, _ in video_tasks:
             logger.info(f"  [{state}] {os.path.basename(path)}")
 
-        # 阶段A：纯 CV 预抽帧（本地模型模式下），全部就绪后再进入 LLM 分析
-        self._preextract_all_frames(video_tasks)
-        # 阶段A2：串行音频分析（SenseVoice，CPU），先生成音频档案供 VLM 参考
-        self._analyze_all_audio()
-        # 音频分析完毕即释放 ASR 显存，把 GPU 完整留给阶段B的 VLM（8GB 卡显存紧张）
-        local_asr = getattr(self.asr_service, "local_service", None)
-        if local_asr is not None:
-            try:
-                local_asr.unload()
-            except Exception as e:
-                logger.debug(f"阶段A2后卸载 ASR 失败: {e}")
+        # 阶段A替代：定位 Phase 0 每片段产物（自适应抽帧 + 音频档案随片段落盘），
+        # 不再由 Phase 1 预抽帧/音频分析；缺失的片段由 VLM 分析时回退现场抽帧/转录
+        self._resolve_phase0_assets(video_tasks)
 
         # 阶段A2.5：参考图预分析（一次性，幂等），生成关键词档案供身份确认调用
         self._profile_references()
@@ -382,11 +220,18 @@ class Phase1Analyzer:
         if state == "RAW":
             return self._process_raw(video_path)
         elif state == "PROCESSED":
+            shot_id = self._next_shot_id()
+            existing = self._load_existing_shot(shot_id)
+            if existing is not None:
+                logger.info(f"[Phase 1] 断点续跑，跳过已分析镜头: {shot_id}")
+                return [existing]
             return self.phase1_processor.process(
                 video_path=video_path,
                 next_shot_id_func=self._next_shot_id,
+                shot_id=shot_id,
                 state="PROCESSED",
                 frames_dir=self._frames_dirs.get(os.path.abspath(video_path)),
+                on_shot_done=self._on_shot_done,
             )
         elif state == "ANALYZED":
             return self.analyzed_processor.process(video_path, meta_format, self._next_shot_id)
@@ -427,6 +272,13 @@ class Phase1Analyzer:
             new_shot_id = self._next_shot_id()
             id_map[rough_shot.shot_id] = new_shot_id
 
+            # 断点续跑：该镜头已有完整配置（json + mp4）则直接复用，跳过 VLM 分析
+            existing = self._load_existing_shot(new_shot_id)
+            if existing is not None:
+                logger.info(f"[Phase 1] 断点续跑，跳过已分析镜头: {new_shot_id}")
+                shots.append(existing)
+                continue
+
             analyzed = self.phase1_processor.process(
                 video_path=clip_path,
                 next_shot_id_func=self._next_shot_id,
@@ -438,6 +290,7 @@ class Phase1Analyzer:
                 tc_in=rough_shot.tc_in,
                 tc_out=rough_shot.tc_out,
                 frames_dir=self._frames_dirs.get(os.path.abspath(clip_path)),
+                on_shot_done=self._on_shot_done,
             )
             shots.extend(analyzed)
 
@@ -574,6 +427,39 @@ class Phase1Analyzer:
 
         return tasks
 
+    def _on_shot_done(self, shot: Shot):
+        """单镜头分析完成回调：立即落盘该镜头配置（CPU 同步写，json 与 mp4 同步出现）。
+
+        保存粒度是镜头而非源视频——一个源视频可能有几十个镜头，
+        等源视频全部跑完再写就无法中途判断输出质量或断点续跑。
+        """
+        try:
+            self._save_shot_configs([shot])
+        except Exception as e:
+            logger.warning(f"[Phase 1] 写出镜头配置失败 {shot.shot_id}: {e}")
+
+    def _load_existing_shot(self, shot_id: str) -> Optional[Shot]:
+        """断点续跑：配置与片段都在则直接重建 Shot，跳过 VLM 分析。
+
+        shot_id 由确定性计数器分配（源视频与片段顺序不变则 ID 对齐），
+        配置里含完整 shot 序列化（见 _save_shot_configs）。
+        """
+        clips_dir = os.path.join(self.output_dir, "phase1_split_clips")
+        clip_path = os.path.join(clips_dir, f"{shot_id}.mp4")
+        config_path = os.path.join(clips_dir, f"{shot_id}_config.json")
+        if not (os.path.exists(clip_path) and os.path.exists(config_path)):
+            return None
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                data = json.load(f)
+            shot_data = data.get("shot")
+            if not shot_data:
+                return None
+            return Shot.from_dict(shot_data)
+        except Exception as e:
+            logger.warning(f"[Phase 1] 读取已有镜头配置失败 {shot_id}，将重新分析: {e}")
+            return None
+
     def _save_shot_configs(self, shots: List[Shot]):
         """为每个 Shot 生成独立的 JSON 配置文件"""
         import json
@@ -595,6 +481,8 @@ class Phase1Analyzer:
                 "duration_sec": shot.duration_sec,
                 "relationships": shot.relationships.to_dict() if shot.relationships else None,
                 "keyframes": shot.keyframes,
+                # 完整 Shot 序列化：断点续跑时直接重建对象，无需重新分析
+                "shot": shot.to_dict(),
             })
 
             config_path = os.path.join(clips_dir, f"{shot.shot_id}_config.json")

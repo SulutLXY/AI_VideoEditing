@@ -203,6 +203,8 @@ class SessionState:
         self.run_label = ""          # 进度条文字
         self.run_done = False        # 完成标志，由 Timer 消费
         self.run_ok = False
+        self.proc = None             # 正在运行的子进程句柄（暂停用）
+        self.paused = False          # 本次结束是否为手动暂停（断点续跑入口）
         self.log = deque(maxlen=800)
         self.suggest_view = ""       # 运行完成后建议切换的视图（如 "review"）
         self.force_edit_view = False
@@ -215,6 +217,8 @@ class SessionState:
         self.run_label = ""
         self.run_done = False
         self.run_ok = False
+        self.proc = None
+        self.paused = False
         self.suggest_view = ""
         self.force_edit_view = False
 
@@ -505,15 +509,16 @@ def _subprocess_python() -> str:
     return str(venv_python) if venv_python.exists() else sys.executable
 
 
-def _run_single_phase(phase: str) -> int:
-    """在工作区内运行 main.py --phase N（--clean 先清旧产物），日志写入 SESSION.log"""
+def _run_single_phase(phase: str, clean: bool = True) -> int:
+    """在工作区内运行 main.py --phase N（--clean 先清旧产物；续跑时不加），日志写入 SESSION.log"""
     config_path = _workspace_path("config.yaml")
     cmd = [
         _subprocess_python(), "main.py",
         "--config", config_path,
         "--phase", phase,
-        "--clean",
     ]
+    if clean:
+        cmd.append("--clean")
     SESSION.log.append(f"[运行] {' '.join(cmd)}")
     process = subprocess.Popen(
         cmd,
@@ -526,31 +531,40 @@ def _run_single_phase(phase: str) -> int:
         bufsize=1,
         universal_newlines=True,
     )
-    assert process.stdout is not None
-    for line in process.stdout:
-        line = line.rstrip()
-        if not line:
-            continue
-        SESSION.log.append(line)
-        # 提取进度文字：取最近的含阶段/百分比/计数的行
-        if any(k in line for k in ["Phase", "第", "/", "镜头", "片段", "节点", "beat"]):
-            if len(line) <= 80:
-                SESSION.run_label = line.strip()
-    return process.wait()
+    SESSION.proc = process
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            SESSION.log.append(line)
+            # 提取进度文字：取最近的含阶段/百分比/计数的行
+            if any(k in line for k in ["Phase", "第", "/", "镜头", "片段", "节点", "beat"]):
+                if len(line) <= 80:
+                    SESSION.run_label = line.strip()
+        return process.wait()
+    finally:
+        SESSION.proc = None
 
 
-def _run_subprocess(phase: str) -> None:
+def _run_subprocess(phase: str, clean: bool = True) -> None:
     """运行单个阶段或组合阶段（如 "0+1" 先粗剪再分析），日志写入 SESSION.log"""
     try:
         ok_all = True
         for ph in phase.split("+"):
-            code = _run_single_phase(ph)
+            code = _run_single_phase(ph, clean=clean)
             if code != 0:
                 ok_all = False
-                SESSION.log.append(f"[失败] {PHASE_LABELS.get(ph, ph)} 退出码 {code}")
+                if SESSION.paused:
+                    SESSION.log.append(f"[暂停] {PHASE_LABELS.get(ph, ph)} 已被用户暂停（退出码 {code}）")
+                else:
+                    SESSION.log.append(f"[失败] {PHASE_LABELS.get(ph, ph)} 退出码 {code}")
                 break
         SESSION.run_ok = ok_all
-        if SESSION.run_ok:
+        if SESSION.paused:
+            SESSION.run_ok = True  # 暂停视为可控结束，非失败
+        elif SESSION.run_ok:
             SESSION.log.append(f"[完成] {PHASE_LABELS.get(phase, phase)} 运行成功")
     except Exception as e:
         SESSION.run_ok = False
@@ -562,8 +576,8 @@ def _run_subprocess(phase: str) -> None:
             SESSION.suggest_view = {"2": "review"}.get(phase, "")
 
 
-def start_step_run(phase: str) -> str:
-    """启动步骤运行（非阻塞，后台线程执行）。返回状态文案。"""
+def start_step_run(phase: str, clean: bool = True) -> str:
+    """启动步骤运行（非阻塞，后台线程执行）。clean=False 用于断点续跑（保留旧产物）。"""
     if SESSION.running:
         return "已有任务在运行，请等待完成"
 
@@ -602,9 +616,10 @@ def start_step_run(phase: str) -> str:
         return "缺少素材/筛选结果，请先完成「③ 镜头筛选」"
 
     SESSION.running = True
+    SESSION.paused = False
     SESSION.run_step = phase
     SESSION.run_label = f"{PHASE_LABELS[phase]} 启动中…"
-    threading.Thread(target=_run_subprocess, args=(phase,), daemon=True).start()
+    threading.Thread(target=_run_subprocess, args=(phase, clean), daemon=True).start()
     return f"{PHASE_LABELS[phase]} 已开始运行"
 
 
@@ -727,8 +742,8 @@ def load_split_clip_configs() -> List[Dict[str, Any]]:
 def load_materials_data() -> pd.DataFrame:
     """右侧素材表：Phase 1 最终素材表（数据源 phase1_split_clips/Sxxx_config.json）。
 
-    台词列来自 config.dialogue；音频标签从 phase1_frames/<stem>/audio_profile.json 读取
-    （事件/情绪/声音环境），与资产分析档案一致。
+    台词列来自 config.dialogue；音频标签从 Phase 0 产物 phase0_rough_clips/<stem>_frames/
+    audio_profile.json 读取（事件/情绪/声音环境），与资产分析档案一致。
     """
     rows = []
     for c in load_split_clip_configs():
@@ -1463,6 +1478,8 @@ def build_ui():
                         run1 = gr.Button("▶ 准备工作区", variant="primary", scale=0)
                         run_p0 = gr.Button("▶ 运行素材粗剪（Phase 0）", scale=0)
                         run_p1 = gr.Button("▶ 运行素材分析（Phase 1）", scale=0)
+                        run_p1_resume = gr.Button("⏯ 继续分析（断点续跑）", scale=0)
+                        run_pause = gr.Button("⏸ 暂停", scale=0)
                         prep_status = gr.Textbox(label="状态", interactive=False, scale=3)
                     with gr.Row():
                         raw_upload = gr.File(
@@ -1664,7 +1681,7 @@ def build_ui():
         # 事件绑定
         # ==================================================================
 
-        run_btns = [run_p0, run_p1, run1, run2, run3, run4]
+        run_btns = [run_p0, run_p1, run_p1_resume, run1, run2, run3, run4]
 
         def _btns_state(interactive: bool):
             return [gr.update(interactive=interactive) for _ in run_btns]
@@ -1766,7 +1783,7 @@ def build_ui():
             "edit_vis", "review_vis",
             "beats_shots", "beats_ro4", "materials", "assign",
             "video", "export_summary", "products", "product_choices", "used_choices", "used_md",
-            "b0", "b1", "b2", "b3", "b4", "b5",
+            "b0", "b1", "b2", "b3", "b4", "b5", "b6",
         ]
 
         TICK_COMPONENTS = [
@@ -1777,13 +1794,13 @@ def build_ui():
             script_edit_view, script_review_view,
             beats_shots_df, beats_ro4_df, materials_df, assign_df,
             final_video, export_summary, products_df, product_pick, used_pick, used_md,
-            run_p0, run_p1, run1, run2, run3, run4,
+            run_p0, run_p1, run_p1_resume, run1, run2, run3, run4,
         ]
 
         # 总是刷新区的组件个数（progress/logfab/log_code + 4 个状态）
         TICK_ALWAYS = 7
         # 按钮区组件个数（run_btns 展开后的尾巴）
-        N_RUN_BTNS = 6
+        N_RUN_BTNS = 7
         # 运行完成时，把结果写进步骤状态栏：TICK_KEYS 中的下标
         TICK_STEP_STATUS_IDX = {"0": 3, "1": 3, "2": 4, "3": 5, "4": 6}
 
@@ -1794,7 +1811,10 @@ def build_ui():
             if full:
                 SESSION.run_done = False
                 step = SESSION.run_step
-                result_msg = "运行完成 ✓" if SESSION.run_ok else "运行失败，请展开日志查看"
+                if SESSION.paused:
+                    result_msg = "已暂停：已完成的镜头配置已保留，点「⏯ 继续分析」断点续跑"
+                else:
+                    result_msg = "运行完成 ✓" if SESSION.run_ok else "运行失败，请展开日志查看"
                 if step == "2" and SESSION.run_ok:
                     SESSION.force_edit_view = False
                 SESSION.run_step = ""
@@ -1892,6 +1912,38 @@ def build_ui():
             fn=on_run_p1,
             outputs=[prep_status, *run_btns],
         )
+
+        # ---------------- ① 断点续跑（Phase 1，无 --clean） ----------------
+        def on_run_p1_resume():
+            if not os.path.exists(_workspace_path("config.yaml")):
+                msg = "错误：请先点击「准备工作区」生成配置"
+                SESSION.status_msgs["prep"] = msg
+                return msg, *_btns_state(True)
+            msg = start_step_run("1", clean=False)
+            SESSION.status_msgs["prep"] = msg
+            if msg.endswith("已开始运行"):
+                return msg, *_btns_state(False)
+            return msg, *_btns_state(True)
+
+        run_p1_resume.click(
+            fn=on_run_p1_resume,
+            outputs=[prep_status, *run_btns],
+        )
+
+        # ---------------- ① 暂停当前运行 ----------------
+        def on_pause():
+            if not SESSION.running:
+                return "没有正在运行的任务"
+            if SESSION.proc is None:
+                return "未找到子进程句柄，请直接关闭页面停止"
+            SESSION.paused = True
+            try:
+                SESSION.proc.terminate()  # Windows 上即结束进程；已落盘的镜头配置不受影响
+                return "已发送暂停信号：当前镜头中止，已完成的配置全部保留，可断点续跑"
+            except Exception as e:
+                return f"暂停失败: {e}"
+
+        run_pause.click(fn=on_pause, outputs=[prep_status])
 
         # ---------------- ② 剧本 ----------------
         def on_run2():

@@ -15,11 +15,16 @@ from src.models import Shot
 
 
 class QualityScorer:
-    """镜头综合质量评分器（剧情导向 v0.3）"""
+    """镜头综合质量评分器（剧情导向 v0.4）
+
+    v0.4：新增台词加分项。原五维权重不变；节点含关键台词时，
+    按「台词对应度 × dialogue_weight」额外叠加（0-10 分制，最高 +2.5），
+    无台词节点得分与 v0.3 完全一致。
+    """
 
     def __init__(self, config: Dict[str, Any] = None):
         self.config = config or {}
-        # 默认权重：剧情匹配度最高，叙事连贯次之
+        # 默认权重：剧情匹配度最高，叙事连贯次之（保持 v0.3 不变）
         self.weights = self.config.get("weights") or {
             "script_match": 0.35,
             "visual_quality": 0.25,
@@ -27,6 +32,8 @@ class QualityScorer:
             "duration_fit": 0.10,
             "metadata_complete": 0.10,
         }
+        # 台词加分项权重（仅节点含关键台词时生效，叠加在五维积分之上）
+        self.dialogue_weight = float(self.config.get("dialogue_weight", 0.25))
 
     def score(self, shot: Shot, context: Optional["ScoreContext"] = None) -> float:
         """
@@ -44,10 +51,12 @@ class QualityScorer:
         shot: Shot,
         script_match: float,
         context: Optional["ScoreContext"] = None,
+        beat_dialogue: str = "",
     ) -> float:
         """用外部给定的剧情匹配分（如 LLM 逐节点精排结果）计算综合质量分 (0-10)。
 
         script_match 取值 0-1，其余维度（画质/连贯/时长适配/元数据）本地计算。
+        beat_dialogue：当前节点的关键台词；非空时叠加台词加分项。
         """
         w = self.weights
         script_match = max(0.0, min(1.0, float(script_match or 0.0)))
@@ -71,8 +80,57 @@ class QualityScorer:
             + w.get("duration_fit", 0.10) * duration_fit
             + w.get("metadata_complete", 0.10) * metadata_complete
         )
+        # 台词加分项：仅节点含关键台词时叠加，不改变原五维算法
+        if (beat_dialogue or "").strip():
+            score += self.dialogue_weight * self._dialogue_match_score(beat_dialogue, shot)
 
         return round(score * 10, 2)
+
+    # ------------------------------------------------------------------
+    # 台词对应度（本地，不依赖 LLM）
+    # ------------------------------------------------------------------
+    # 阿拉伯数字转中文数字：ASR 常出"12回"，剧本写"十二回"，统一后提高重合度
+    _DIGIT_MAP = str.maketrans("0123456789", "〇一二三四五六七八九")
+
+    @classmethod
+    def _normalize_text(cls, text: str) -> str:
+        """去标点/引号/空白，数字转中文，只留字符（中文 n-gram 不需要分词）"""
+        import re as _re
+        text = str(text or "").lower().translate(cls._DIGIT_MAP)
+        return _re.sub(r"[^\w\u4e00-\u9fff]", "", text)
+
+    @classmethod
+    def _bigrams(cls, text: str) -> set:
+        return {text[i:i + 2] for i in range(len(text) - 1)} or ({text} if text else set())
+
+    def _dialogue_match_score(self, beat_dialogue: str, shot: Shot) -> float:
+        """节点关键台词 vs 镜头台词的字 bigram 覆盖率 (0-1)，阈值制。
+
+        逐字匹配：coverage = 节点台词的 bigram 被镜头台词覆盖的比例。
+        - coverage >= 0.7（镜头覆盖了节点台词七成以上内容）→ 给满分 1.0，
+          该镜头进入台词优先序列（拿满台词加分）
+        - coverage < 0.7 → 按比例 coverage/0.7 给部分分，衔接镜有分但不占优
+        镜头无台词 → 0；节点台词过短 → 按整串包含度算。
+        """
+        beat_text = self._normalize_text(beat_dialogue)
+        shot_text = self._normalize_text(shot.dialogue or shot.asr_text or "")
+        if not beat_text:
+            return 0.5
+        if not shot_text:
+            return 0.0
+        if len(beat_text) < 2:
+            return 1.0 if beat_text in shot_text else 0.0
+
+        beat_bg = self._bigrams(beat_text)
+        shot_bg = self._bigrams(shot_text)
+        if not beat_bg:
+            return 0.0
+        coverage = len(beat_bg & shot_bg) / len(beat_bg)
+
+        threshold = 0.7
+        if coverage >= threshold:
+            return 1.0
+        return round(coverage / threshold, 4)
 
     def _script_match_score(self, shot: Shot) -> float:
         """剧情匹配度：剧本锚定置信度 + 行为/动作/台词匹配信号"""
