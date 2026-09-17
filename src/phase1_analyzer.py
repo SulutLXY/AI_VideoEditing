@@ -60,7 +60,7 @@ class Phase1Analyzer:
         )
 
         self._shot_counter = 0
-        # Phase 0 产物映射：片段绝对路径 -> phase0_rough_clips/Sxxx_frames/
+        # Phase 0 产物映射：片段绝对路径 -> phase0_rough_clips/Sxxx/frames/
         # （自适应抽帧 + 音频档案，由 _resolve_phase0_assets 填充）
         self._frames_dirs: Dict[str, str] = {}
 
@@ -71,9 +71,10 @@ class Phase1Analyzer:
     def _resolve_phase0_assets(self, video_tasks: List[Tuple[str, str, Optional[str]]]):
         """阶段A替代：定位 Phase 0 每片段产物（自适应抽帧 + 音频档案）。
 
-        Phase 0 已随片段落盘 phase0_rough_clips/Sxxx_frames/
-        （frames.json/meta.json/audio.wav/audio_profile.json），这里只做映射不做重算；
-        找不到的片段由 VLM 分析时回退现场抽帧、由 ASR 服务回退现场转录。
+        Phase 0 已随片段落盘 phase0_rough_clips/Sxxx/（frames/ 子目录内含
+        frames.json/meta.json/audio.wav/audio_profile.json），这里只做映射不做重算；
+        兼容旧版 Sxxx_frames/ 平铺布局。找不到的片段由 VLM 分析时回退现场抽帧、
+        由 ASR 服务回退现场转录。
         """
         rough_config_path = os.path.join(self.output_dir, "phase0_rough_config.json")
         rough_shots: List[Shot] = []
@@ -86,11 +87,21 @@ class Phase1Analyzer:
 
         clips_dir = os.path.join(self.output_dir, "phase0_rough_clips")
 
+        def _find_frames_dir(stem: str) -> Optional[str]:
+            # 新布局：<stem>/frames/；旧布局：<stem>_frames/
+            for cand in (
+                os.path.join(clips_dir, stem, "frames"),
+                os.path.join(clips_dir, f"{stem}_frames"),
+            ):
+                if os.path.exists(os.path.join(cand, "frames.json")):
+                    return cand
+            return None
+
         def _map_clip(cp: str):
             ap = os.path.abspath(cp)
             stem = os.path.splitext(os.path.basename(ap))[0]
-            frames_dir = os.path.join(clips_dir, f"{stem}_frames")
-            if os.path.exists(os.path.join(frames_dir, "frames.json")):
+            frames_dir = _find_frames_dir(stem)
+            if frames_dir:
                 self._frames_dirs[ap] = frames_dir
 
         for path, state, _ in video_tasks:
@@ -354,10 +365,14 @@ class Phase1Analyzer:
         if clip_path and os.path.exists(clip_path):
             return clip_path
 
-        # 其次尝试按 shot_id 在 phase0_rough_clips 中查找
-        clip_path = os.path.join(self.output_dir, "phase0_rough_clips", f"{rough_shot.shot_id}.mp4")
-        if os.path.exists(clip_path):
-            return clip_path
+        # 其次按 shot_id 查找：新布局 Sxxx/Sxxx.mp4，旧布局平铺 Sxxx.mp4
+        for cand in (
+            os.path.join(self.output_dir, "phase0_rough_clips", rough_shot.shot_id,
+                         f"{rough_shot.shot_id}.mp4"),
+            os.path.join(self.output_dir, "phase0_rough_clips", f"{rough_shot.shot_id}.mp4"),
+        ):
+            if os.path.exists(cand):
+                return cand
 
         # 回退到 source_path（整段分析）
         return rough_shot.source_path

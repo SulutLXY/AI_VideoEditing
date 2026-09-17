@@ -7,18 +7,23 @@ Phase 0: CV 粗剪 + 片段级产物（v0.3）
 - 基于 OpenCV 逐帧灰度直方图差异 + 孤立峰值分析判断硬切点。
 - 对持续高活动区域（运动/叠化/淡入淡出/高速镜头）做软转场保护，不切分。
 
-每个粗剪片段产出"四件套"（出一个同步落盘一个，支持断点续跑）：
-- Sxxx.mp4            粗剪片段（FFmpeg -c copy）
-- Sxxx_config.json    片段配置：切点/时长/帧率/画质/运动档案（光流幅值、主体速度档、
-                      各档帧数分布）/抽帧清单/音频档案摘要
-- Sxxx_frames/        自适应三档参考帧（480p jpg + frames.json + meta.json + motion.json）
-                      按片段内局部变化速度抽帧：静止档(≥0.90)显著变化+2s锚点 /
-                      中速档(0.70~0.90)每0.5s / 快变化档(<0.70)每0.1s且单段封顶10帧；
-                      档位切换带 0.3s 滞回，相似度按片段自身中位数基准归一化
-- Sxxx_frames/audio.wav + audio_profile.json
-                      16k 单声道音频 + SenseVoice 分析档案（台词/语言/情绪/事件/
-                      声音环境：speech / ambient_or_bgm / silent），供 Phase 1 VLM prompt
-                      注入与 Phase 4 混音参考（CPU 串行跑，幂等跳过已有档案）
+每个粗剪片段一个独立文件夹（phase0_rough_clips/Sxxx/），随切出同步落盘，
+支持断点续跑：
+
+- Sxxx/Sxxx.mp4         粗剪片段（FFmpeg -c copy）
+- Sxxx/Sxxx_config.json 片段配置：切点/时长/帧率/画质/运动档案（光流幅值、主体速度档、
+                        各档帧数分布）/抽帧清单/音频档案摘要/首尾帧缩略图路径
+- Sxxx/Sxxx_first.jpg   首帧缩略图（资产库预览）
+- Sxxx/Sxxx_last.jpg    尾帧缩略图（资产库预览）
+- Sxxx/frames/          自适应三档参考帧（480p jpg + frames.json + meta.json + motion.json
+                        + first.jpg/last.jpg）
+                        按片段内局部变化速度抽帧：静止档(raw≥0.90且光流<0.8)显著变化+2s锚点 /
+                        中速档(0.70~0.90)每0.5s / 快变化档(<0.70)每0.1s且单段封顶10帧；
+                        档位切换带 0.3s 滞回，静止档用绝对阈值、快档加片段内相对判据
+- Sxxx/frames/audio.wav + audio_profile.json
+                        16k 单声道音频 + SenseVoice 分析档案（台词/语言/情绪/事件/
+                        声音环境：speech / ambient_or_bgm / silent），供 Phase 1 VLM prompt
+                        注入与 Phase 4 混音参考（串行跑，幂等跳过已有档案）
 
 积分规则（v0.2 定版）：
 - 逐帧计算相邻帧灰度直方图差异，得到 cut_score（0~1）。
@@ -173,8 +178,10 @@ class RoughCutAnalyzer:
         返回注入 shot.cv_metadata["shot_config"] 的配置 dict。
         所有步骤幂等：已有产物直接复用；单步失败不影响其余产物。
         """
-        clips_dir = self.rough_clips_dir
-        frames_dir = os.path.join(clips_dir, f"{shot_id}_frames")
+        # 每镜头一个独立文件夹：视频/配置/首尾帧并排，frames/ 与音频档案在子目录
+        shot_dir = os.path.join(self.rough_clips_dir, shot_id)
+        os.makedirs(shot_dir, exist_ok=True)
+        frames_dir = os.path.join(shot_dir, "frames")
 
         clip_cfg: Dict[str, Any] = {
             "shot_id": shot_id,
@@ -187,9 +194,11 @@ class RoughCutAnalyzer:
             "fps": fps,
         }
 
-        # 1) 自适应三档抽帧（480p jpg + frames.json + meta.json + motion.json）
+        # 1) 自适应五档抽帧（480p jpg + frames.json + meta.json + motion.json）
+        #    首帧= f_0000、尾帧= 序列最后一帧，天然在 f_xxxx 序列中，不单独落盘
         motion: Dict[str, Any] = {}
         frames_meta: Dict[str, Any] = {}
+        frames_list: List[Dict[str, Any]] = []
         if self.adaptive_enabled and clip_path and os.path.exists(clip_path):
             try:
                 from src.adaptive_frame_extractor import extract_adaptive_frames
@@ -197,8 +206,14 @@ class RoughCutAnalyzer:
                 if result:
                     motion = result.get("motion", {})
                     frames_meta = result.get("meta", {})
+                    frames_list = result.get("frames", []) or []
             except Exception as e:
                 logger.warning(f"[Phase 0] 自适应抽帧失败 {shot_id}: {e}")
+        # 首尾帧预览直接指向 f_xxxx 序列的首尾两张图
+        clip_cfg["thumbnails"] = {
+            "first": f"frames/{frames_list[0]['file']}" if frames_list else "",
+            "last": f"frames/{frames_list[-1]['file']}" if frames_list else "",
+        }
         clip_cfg["frames"] = {
             "dir": os.path.basename(frames_dir),
             "count": frames_meta.get("frame_count", 0),
@@ -220,8 +235,8 @@ class RoughCutAnalyzer:
             "sound_env": audio_profile.get("sound_env", ""),
         }
 
-        # 3) 独立 config.json 随片段同步落盘
-        config_path = os.path.join(clips_dir, f"{shot_id}_config.json")
+        # 3) 独立 config.json 随片段同步落盘（与 mp4 同文件夹）
+        config_path = os.path.join(shot_dir, f"{shot_id}_config.json")
         clip_cfg["config_path"] = os.path.basename(config_path)
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(clip_cfg, f, ensure_ascii=False, indent=2)
@@ -621,9 +636,11 @@ class RoughCutAnalyzer:
             end = cut_times[i + 1]
             shot_id = self._next_shot_id()
 
-            # FFmpeg 切分
+            # FFmpeg 切分（每镜头一个独立文件夹）
             ext = os.path.splitext(video_path)[1] or ".mp4"
-            clip_path = os.path.join(self.rough_clips_dir, f"{shot_id}{ext}")
+            shot_dir = os.path.join(self.rough_clips_dir, shot_id)
+            os.makedirs(shot_dir, exist_ok=True)
+            clip_path = os.path.join(shot_dir, f"{shot_id}{ext}")
             try:
                 split_video(video_path, clip_path, start, end, copy=True)
             except Exception as e:
@@ -750,7 +767,9 @@ class RoughCutAnalyzer:
         fps = cv_meta.get("fps", 24.0)
         ext = os.path.splitext(video_path)[1] or ".mp4"
 
-        clip_path = os.path.join(self.rough_clips_dir, f"{shot_id}{ext}")
+        shot_dir = os.path.join(self.rough_clips_dir, shot_id)
+        os.makedirs(shot_dir, exist_ok=True)
+        clip_path = os.path.join(shot_dir, f"{shot_id}{ext}")
         try:
             split_video(video_path, clip_path, 0.0, duration, copy=True)
         except Exception as e:

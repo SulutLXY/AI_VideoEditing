@@ -230,6 +230,27 @@ def main():
 
     args = parser.parse_args()
 
+    if not args.all and args.phase is None and not args.preprocess_script \
+            and not args.export_anchor_corrections and not args.apply_anchor_corrections:
+        # 双击 main.py（无参数）的默认行为：直接启动 Web UI，不加载/校验配置，
+        # 避免因配置报错导致控制台一闪而退。launcher 会先释放已占用的端口，实现"双击即重启"。
+        print("未指定 --all / --phase，自动启动 Web UI（双击 main.py 默认行为）...")
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        launcher = os.path.join(project_root, "launcher.py")
+        venv_python = os.path.join(project_root, ".venv311", "Scripts", "python.exe")
+        py = venv_python if os.path.exists(venv_python) else sys.executable
+        try:
+            ret = subprocess.run([py, launcher, "--port", "7860"], cwd=project_root).returncode
+            if ret != 0:
+                # 启动失败时暂停窗口，避免双击场景下一闪而退看不到报错
+                print(f"\nWeb UI 异常退出，退出码: {ret}")
+                if sys.platform == "win32":
+                    os.system("pause")
+            sys.exit(ret)
+        except KeyboardInterrupt:
+            print("\n已退出")
+            sys.exit(0)
+
     # 检查配置文件
     if not os.path.exists(args.config):
         print(f"错误: 配置文件不存在: {args.config}")
@@ -317,24 +338,9 @@ def main():
     # 剧本大纲只在 Phase 2 及以后使用
     script_beats = None
 
-    # 确定运行阶段
+    # 确定运行阶段（无参双击已在 main() 入口直接拉起 Web UI，不会走到这里）
     run_all = args.all
     run_phase = args.phase
-
-    if not run_all and run_phase is None:
-        # 双击 main.py（无参数）的默认行为：启动 Web UI 前后端一体服务。
-        # launcher 会先释放已占用的端口，实现"双击即重启"。
-        print("未指定 --all / --phase，自动启动 Web UI（双击 main.py 默认行为）...")
-        project_root = os.path.dirname(os.path.abspath(__file__))
-        launcher = os.path.join(project_root, "launcher.py")
-        venv_python = os.path.join(project_root, ".venv311", "Scripts", "python.exe")
-        py = venv_python if os.path.exists(venv_python) else sys.executable
-        try:
-            ret = subprocess.run([py, launcher, "--port", "7860"], cwd=project_root).returncode
-            sys.exit(ret)
-        except KeyboardInterrupt:
-            print("\n已退出")
-            sys.exit(0)
 
     phases_to_run = [0, 1, 2, 3, 4] if run_all else [run_phase]
 

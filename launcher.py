@@ -123,6 +123,21 @@ class Launcher:
             self.log(f"释放端口 {port} 时出错: {e}")
             return False
 
+    @staticmethod
+    def find_free_port(preferred: int, max_attempts: int = 10) -> int:
+        """从 preferred 起探测可绑定端口。7860 常被系统临时占用（如浏览器
+        出站连接的 TIME_WAIT 残留），探测失败自动顺延，避免启动即崩。"""
+        import socket
+        for offset in range(max_attempts):
+            candidate = preferred + offset
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                try:
+                    s.bind(("0.0.0.0", candidate))
+                    return candidate
+                except OSError:
+                    continue
+        raise RuntimeError(f"{preferred}~{preferred + max_attempts - 1} 端口均被占用，无法启动")
+
     def start_webui(self):
         """启动 webui.py 服务"""
         cmd = [sys.executable, str(WEBUI), "--port", str(self.port)]
@@ -138,6 +153,8 @@ class Launcher:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",      # webui 输出 UTF-8（中文日志），固定编码避免 GBK 解码崩线程
+            errors="replace",
             bufsize=1,
             universal_newlines=True,
         )
@@ -162,10 +179,13 @@ class Launcher:
         webbrowser.open(url)
 
     def stream_output(self):
-        """在控制台实时输出 Web UI 日志"""
+        """在控制台实时输出 Web UI 日志（webui 输出为 UTF-8，解码失败时替换不中断）"""
         if self.process and self.process.stdout:
             for line in self.process.stdout:
-                print(line, end="")
+                try:
+                    print(line, end="")
+                except UnicodeEncodeError:
+                    print(line.encode("utf-8", errors="replace").decode("utf-8"), end="")
 
     def run(self):
         """主流程"""
@@ -178,9 +198,17 @@ class Launcher:
         if not self.check_dependencies():
             self.install_dependencies()
 
-        # 先释放端口，再启动，实现双击即重启
+        # 先释放端口（结束旧的 LISTENING 进程），再探测可绑定端口（避开 TIME_WAIT 残留），最后启动
         self.kill_process_on_port(self.port)
         time.sleep(1)
+        try:
+            free_port = self.find_free_port(self.port)
+        except RuntimeError as e:
+            self.log(str(e))
+            sys.exit(1)
+        if free_port != self.port:
+            self.log(f"端口 {self.port} 被占用（可能是系统临时占用），改用端口 {free_port}")
+            self.port = free_port
 
         self.start_webui()
 
@@ -194,6 +222,9 @@ class Launcher:
             self.open_browser()
         else:
             self.log("服务启动超时，请检查日志")
+            if self.process and self.process.poll() is not None:
+                # 服务进程已崩溃：非零退出，让上游（双击 main.py）暂停窗口展示错误
+                sys.exit(1)
 
         try:
             self.process.wait()

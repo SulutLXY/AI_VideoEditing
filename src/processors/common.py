@@ -158,8 +158,9 @@ def resolve_keyframe_paths(
 ) -> List[str]:
     """解析供 Phase 2 去重/特征使用的关键帧图片路径。
 
-    优先复用 Phase 0 自适应抽帧（phase0_rough_clips/<stem>_frames/f_*.jpg，取首/中/尾
-    最多 3 张）——与 VLM 分析看的是同一批图，且不再生成 phase1_keyframes 重复产物；
+    优先复用 Phase 0 自适应抽帧（phase0_rough_clips/<stem>/frames/f_*.jpg，取首/中/尾
+    最多 3 张；兼容旧版 <stem>_frames/ 平铺布局）——与 VLM 分析看的是同一批图，
+    且不再生成 phase1_keyframes 重复产物；
     无预抽帧（在线 provider 或预抽失败）时回退 ffmpeg 现场抽取，
     此时按片段文件自身的 0~duration 取时间码，避免原素材时间码导致 -ss 越界。
     """

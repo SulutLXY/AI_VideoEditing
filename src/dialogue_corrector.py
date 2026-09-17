@@ -13,7 +13,7 @@
    解析失败或返回空则保留原文
 4. 回写三处产物：
    - phase1_split_clips/Sxxx_config.json（shot.dialogue / shot.asr_text / 顶层 dialogue）
-   - phase0_rough_clips/Sxxx_frames/audio_profile.json（text + transcript 分段 +
+   - phase0_rough_clips/Sxxx/frames/audio_profile.json（text + transcript 分段 +
      dialogue_corrected 标记）
    - phase1_analysis.json（总表同步更新）
 
@@ -218,9 +218,15 @@ class DialogueCorrector:
         return False
 
     def _audio_profile_path(self, shot_id: str) -> Optional[str]:
-        frames_dir = os.path.join(self.output_dir, "phase0_rough_clips", f"{shot_id}_frames")
-        p = os.path.join(frames_dir, "audio_profile.json")
-        return p if os.path.exists(p) else None
+        # 新布局 Sxxx/frames/，旧布局 Sxxx_frames/
+        for frames_dir in (
+            os.path.join(self.output_dir, "phase0_rough_clips", shot_id, "frames"),
+            os.path.join(self.output_dir, "phase0_rough_clips", f"{shot_id}_frames"),
+        ):
+            p = os.path.join(frames_dir, "audio_profile.json")
+            if os.path.exists(p):
+                return p
+        return None
 
     @staticmethod
     def _apply(shot: Shot, corrected: str):

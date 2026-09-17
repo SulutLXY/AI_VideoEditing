@@ -601,10 +601,8 @@ def start_step_run(phase: str, clean: bool = True) -> str:
     # 前置产物检查
     if phase == "1":
         rough_dir = _output_path("phase0_rough_clips")
-        has_rough = os.path.isdir(rough_dir) and any(
-            f.lower().endswith((".mp4", ".mov", ".avi", ".mkv", ".webm"))
-            for f in os.listdir(rough_dir)
-        )
+        from src.phase0_paths import list_rough_clips
+        has_rough = bool(list_rough_clips(rough_dir))
         if not has_rough:
             return "缺少 Phase 0 粗剪片段，请先运行「▶ 运行素材粗剪（Phase 0）」"
     if phase == "3" and not os.path.exists(_output_path("script_beats_analysis.json")):
@@ -742,7 +740,7 @@ def load_split_clip_configs() -> List[Dict[str, Any]]:
 def load_materials_data() -> pd.DataFrame:
     """右侧素材表：Phase 1 最终素材表（数据源 phase1_split_clips/Sxxx_config.json）。
 
-    台词列来自 config.dialogue；音频标签从 Phase 0 产物 phase0_rough_clips/<stem>_frames/
+    台词列来自 config.dialogue；音频标签从 Phase 0 产物 phase0_rough_clips/<stem>/frames/
     audio_profile.json 读取（事件/情绪/声音环境），与资产分析档案一致。
     """
     rows = []
@@ -1120,7 +1118,9 @@ def load_resource_library() -> Tuple[str, pd.DataFrame]:
 
     p0_dir = _output_path(os.path.basename(RESOURCE_ROUGH_CLIPS_DIR))
     if os.path.isdir(p0_dir):
-        n = len([x for x in os.listdir(p0_dir) if os.path.isfile(os.path.join(p0_dir, x))])
+        # 每镜头一个 Sxxx/ 子文件夹（内含 mp4 + config + 首尾帧），统计含 mp4 的文件夹
+        from src.phase0_paths import list_rough_clips
+        n = len(list_rough_clips(p0_dir))
         lines.append(f"Phase 0 粗剪片段：{n} 个（{RESOURCE_ROUGH_CLIPS_DIR}/）")
     split_dir = _output_path(os.path.basename(RESOURCE_SPLIT_CLIPS_DIR))
 
